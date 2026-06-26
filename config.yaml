@@ -35,12 +35,12 @@ migration:
   check_disabled_triggers_after_run: true
 
   tables:
-    - source_table: oauth_client_details
-      target_table: oauth_client_details
+    - source_table: dummy_table
+      target_table: dummy_table
       load_type: incremental
-      incremental_column: crtdate
+      incremental_column: updated_at
       partition_column: null
       partition_type: null
       business_key_columns:
-        - client_id
+        - id
       enabled: true

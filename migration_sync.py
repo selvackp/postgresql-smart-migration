@@ -808,11 +808,11 @@ def reset_table_sequences(conn, schema_name, table_name):
     query = """
         SELECT
             c.column_name,
-            pg_get_serial_sequence(format('%I.%I', c.table_schema, c.table_name), c.column_name)
+            pg_get_serial_sequence(format('%%I.%%I', c.table_schema, c.table_name), c.column_name)
         FROM information_schema.columns c
         WHERE c.table_schema = %s
           AND c.table_name = %s
-          AND pg_get_serial_sequence(format('%I.%I', c.table_schema, c.table_name), c.column_name) IS NOT NULL
+          AND pg_get_serial_sequence(format('%%I.%%I', c.table_schema, c.table_name), c.column_name) IS NOT NULL
     """
     with conn.cursor() as cur:
         cur.execute(query, (schema_name, table_name))

@@ -31,13 +31,25 @@ The main settings live under `migration`.
 - `batch_size`: rows per batch.
 - `checkpoint_file`: JSON checkpoint path.
 - `error_table`: target-side bad-row table name.
+- `timezone`: database session timezone used while reading/writing timestamps. The example uses `Asia/Kolkata`; use `UTC` if your migration convention is UTC.
 - `disable_triggers_globally`: disables user triggers during each table load unless a table overrides it with `disable_triggers_during_load`.
 - `reset_sequences`: resets serial/bigserial/identity-backed sequences after each successful table load.
 - `stop_on_table_error`: when `false`, one table failure is logged and the next table continues.
+- `truncate_long_strings`: when `true`, trims over-length `varchar(n)` values and logs a warning; when `false`, logs those rows to `migration_error_log`.
 - `business_key_columns`: optional; if omitted, the script detects target PK, source PK, target unique key, then source unique key.
 - `partition_type`: set to `range` or `list` with `partition_column` to create missing partitions.
 
 For incremental loads, each table must set `incremental_column`.
+
+Per-table `column_defaults` can fill NULL source values before target NOT NULL validation:
+
+```yaml
+column_defaults:
+  status: "active"
+  retry_count: 0
+```
+
+`timezone` runs `SET TIME ZONE` on both source and target sessions. It affects `timestamptz` interpretation/display and PostgreSQL time functions, but it does not rewrite `timestamp without time zone` values.
 
 ## Checkpoints
 

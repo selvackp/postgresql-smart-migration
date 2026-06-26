@@ -1,6 +1,6 @@
 source:
   host: ""
-  port: 58311
+  port: 5432
   database: ""
   user: ""
   password: ""
@@ -8,7 +8,7 @@ source:
 
 target:
   host: ""
-  port: 58311
+  port: 5432
   database: ""
   user: ""
   password: ""

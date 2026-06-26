@@ -23,6 +23,10 @@ NUMERIC_TYPES = ("bigint", "integer", "smallint", "numeric", "decimal", "real", 
 JSON_TYPES = ("json", "jsonb")
 
 
+class PreMigrationValidationError(Exception):
+    pass
+
+
 def load_config(config_file="config.yaml"):
     with open(config_file, "r") as f:
         cfg = yaml.safe_load(f)
@@ -141,6 +145,66 @@ def get_unique_key_columns(conn, schema_name, table_name):
     return list(row[1]) if row else []
 
 
+def normalize_type_name(meta):
+    data_type = meta["data_type"]
+    udt_name = meta.get("udt_name")
+    if data_type == "USER-DEFINED" and udt_name:
+        return udt_name
+    return data_type
+
+
+def is_type_compatible(source_meta, target_meta):
+    source_type = normalize_type_name(source_meta)
+    target_type = normalize_type_name(target_meta)
+    if source_type == target_type:
+        return True, False
+
+    source_udt = source_meta.get("udt_name")
+    target_udt = target_meta.get("udt_name")
+    if source_udt and target_udt and source_udt == target_udt:
+        return True, False
+
+    compatible_pairs = {
+        ("smallint", "integer"),
+        ("smallint", "bigint"),
+        ("smallint", "numeric"),
+        ("smallint", "decimal"),
+        ("integer", "bigint"),
+        ("integer", "numeric"),
+        ("integer", "decimal"),
+        ("bigint", "numeric"),
+        ("bigint", "decimal"),
+        ("real", "double precision"),
+        ("character varying", "text"),
+        ("character", "text"),
+        ("timestamp without time zone", "timestamp with time zone"),
+    }
+    if (source_type, target_type) in compatible_pairs:
+        return True, True
+
+    if source_type in JSON_TYPES and target_type in JSON_TYPES:
+        return True, True
+
+    if source_type == "ARRAY" and target_type == "ARRAY" and source_udt == target_udt:
+        return True, False
+
+    return False, False
+
+
+def validate_datatype_compatibility(source_meta, target_meta, common_columns, target_table):
+    errors = []
+    for col in common_columns:
+        compatible, warn = is_type_compatible(source_meta[col], target_meta[col])
+        source_type = normalize_type_name(source_meta[col])
+        target_type = normalize_type_name(target_meta[col])
+        if compatible and warn:
+            logging.warning(f"[{target_table}] Compatible datatype difference for {col}: source={source_type}, target={target_type}")
+        elif not compatible:
+            errors.append(f"{col}: source={source_type}, target={target_type}")
+    if errors:
+        raise PreMigrationValidationError(f"[{target_table}] Incompatible datatype mappings: {'; '.join(errors)}")
+
+
 def detect_business_key(source_conn, target_conn, cfg, table_cfg):
     source_schema, target_schema = cfg["source"]["schema"], cfg["target"]["schema"]
     source_table, target_table = table_cfg["source_table"], table_cfg["target_table"]
@@ -254,18 +318,22 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
     source_schema, target_schema = cfg["source"]["schema"], cfg["target"]["schema"]
     source_table, target_table = table_cfg["source_table"], table_cfg["target_table"]
     source_meta, target_meta = get_table_columns(source_conn, source_schema, source_table), get_table_columns(target_conn, target_schema, target_table)
-    if not source_meta: raise Exception(f"[{target_table}] Source table not found: {source_schema}.{source_table}")
-    if not target_meta: raise Exception(f"[{target_table}] Target table not found: {target_schema}.{target_table}")
+    if not source_meta: raise PreMigrationValidationError(f"[{target_table}] Source table not found: {source_schema}.{source_table}")
+    if not target_meta: raise PreMigrationValidationError(f"[{target_table}] Target table not found: {target_schema}.{target_table}")
     common_columns = [c for c in target_meta.keys() if c in source_meta.keys()]
-    if not common_columns: raise Exception(f"[{target_table}] No common columns found")
+    if not common_columns: raise PreMigrationValidationError(f"[{target_table}] No common columns found")
+    validate_datatype_compatibility(source_meta, target_meta, common_columns, target_table)
     incremental_column = table_cfg.get("incremental_column")
-    if load_type == "incremental" and not incremental_column: raise Exception(f"[{target_table}] incremental_column is required for incremental load")
-    if incremental_column and incremental_column not in common_columns: raise Exception(f"[{target_table}] incremental_column {incremental_column} not found in source and target")
-    business_key_columns = detect_business_key(source_conn, target_conn, cfg, table_cfg)
+    if load_type == "incremental" and not incremental_column: raise PreMigrationValidationError(f"[{target_table}] incremental_column is required for incremental load")
+    if incremental_column and incremental_column not in common_columns: raise PreMigrationValidationError(f"[{target_table}] incremental_column {incremental_column} not found in source and target")
+    try:
+        business_key_columns = detect_business_key(source_conn, target_conn, cfg, table_cfg)
+    except Exception as e:
+        raise PreMigrationValidationError(str(e))
     for key_col in business_key_columns:
-        if key_col not in common_columns: raise Exception(f"[{target_table}] Business key {key_col} not found in source and target")
+        if key_col not in common_columns: raise PreMigrationValidationError(f"[{target_table}] Business key {key_col} not found in source and target")
     partition_column = table_cfg.get("partition_column")
-    if partition_column and partition_column not in common_columns: raise Exception(f"[{target_table}] Partition column {partition_column} not found in source and target")
+    if partition_column and partition_column not in common_columns: raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} not found in source and target")
     logging.info(f"[{target_table}] Auto mapped columns: {common_columns}")
     logging.info(f"[{target_table}] Business key columns: {business_key_columns}")
     logging.info(f"[{target_table}] Load type: {load_type}")
@@ -331,6 +399,10 @@ def validate_normalized_value(col, value, meta):
     return None
 
 
+def is_limited_string_column(meta):
+    return meta.get("data_type") in ("character varying", "character") and meta.get("max_length")
+
+
 def apply_column_defaults(row_dict, table_cfg):
     defaults = table_cfg.get("column_defaults") or {}
     for col, default_value in defaults.items():
@@ -353,6 +425,7 @@ def normalize_row_for_target(row, columns, target_meta, table_cfg):
 def validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_cfg):
     validate_lengths = cfg["migration"].get("validate_lengths", True)
     validate_not_null = cfg["migration"].get("validate_not_null", True)
+    truncate_long_strings = cfg["migration"].get("truncate_long_strings", False)
     skip_bad_rows = table_cfg.get("skip_bad_rows", cfg["migration"].get("skip_bad_rows", True))
     good_rows, bad_rows = [], []
     key_indexes = [columns.index(c) for c in business_key_columns]
@@ -369,8 +442,12 @@ def validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_c
             meta = target_meta[col]
             if validate_not_null and meta["is_nullable"] == "NO" and value is None:
                 errors.append(f"{col} is NULL but target column is NOT NULL")
-            if validate_lengths and value is not None and meta["max_length"] and isinstance(value, str) and len(value) > meta["max_length"]:
-                errors.append(f"{col} length {len(value)} exceeds target max length {meta['max_length']}")
+            if validate_lengths and value is not None and is_limited_string_column(meta) and isinstance(value, str) and len(value) > meta["max_length"]:
+                if truncate_long_strings:
+                    logging.warning(f"Truncated long string in column {col}: length {len(value)} exceeds target max length {meta['max_length']}")
+                    row_dict[col] = value[:meta["max_length"]]
+                else:
+                    errors.append(f"{col} length {len(value)} exceeds target max length {meta['max_length']}")
             validation_error = validate_normalized_value(col, value, meta)
             if validation_error:
                 errors.append(validation_error)
@@ -379,7 +456,7 @@ def validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_c
             bad_rows.append({"business_key": business_key, "error_message": "; ".join(errors), "row_data": row_dict})
             if not skip_bad_rows: raise Exception(f"Bad row found for key {business_key}: {'; '.join(errors)}")
         else:
-            good_rows.append(normalized_row)
+            good_rows.append(tuple(row_dict[c] for c in columns))
     return good_rows, bad_rows
 
 
@@ -710,6 +787,17 @@ def check_disabled_triggers(conn, schema_name):
             )
     else:
         logging.info("Trigger safety check passed. No disabled user triggers found.")
+    return len(rows)
+
+
+def get_bad_row_count(conn, schema_name, error_table):
+    query = sql.SQL("SELECT COUNT(*) FROM {schema}.{error_table}").format(
+        schema=sql.Identifier(schema_name),
+        error_table=sql.Identifier(error_table)
+    )
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return int(cur.fetchone()[0])
 
 
 def reset_table_sequences(conn, schema_name, table_name):
@@ -776,6 +864,8 @@ def main():
     success_tables = []
     failed_tables = []
     skipped_tables = []
+    bad_row_count = 0
+    disabled_trigger_count = 0
 
     try:
         source_conn = get_connection(cfg["source"], "source_migration_sync")
@@ -848,6 +938,14 @@ def main():
                 success_tables.append(table_name)
                 logging.info(f"[{table_name}] Table migration completed")
 
+            except PreMigrationValidationError as e:
+                target_conn.rollback()
+                logging.error(f"[{table_name}] Pre-migration validation failed: {e}")
+                if cfg["migration"].get("stop_on_table_error", False):
+                    raise e
+                skipped_tables.append(table_name)
+                continue
+
             except Exception as e:
                 target_conn.rollback()
 
@@ -863,14 +961,22 @@ def main():
 
                 continue
 
+        bad_row_count = get_bad_row_count(
+            target_conn,
+            cfg["target"]["schema"],
+            cfg["migration"]["error_table"]
+        )
+
         if cfg["migration"].get("check_disabled_triggers_after_run", True):
-            check_disabled_triggers(target_conn, cfg["target"]["schema"])
+            disabled_trigger_count = check_disabled_triggers(target_conn, cfg["target"]["schema"])
 
         logging.info("=" * 100)
         logging.info("MIGRATION SUMMARY")
         logging.info(f"Success tables: {len(success_tables)}")
         logging.info(f"Failed tables : {len(failed_tables)}")
         logging.info(f"Skipped tables: {len(skipped_tables)}")
+        logging.info(f"Bad rows logged: {bad_row_count}")
+        logging.info(f"Disabled user triggers: {disabled_trigger_count}")
 
         for item in failed_tables:
             logging.error(f"FAILED TABLE: {item['table']} | ERROR: {item['error']}")

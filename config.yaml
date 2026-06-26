@@ -28,6 +28,7 @@ migration:
   partition_granularity: "daily"   # daily or monthly
   validate_lengths: true
   validate_not_null: true
+  truncate_long_strings: false
   skip_bad_rows: true
   use_advisory_lock: true
   advisory_lock_key: 987654321
@@ -43,4 +44,5 @@ migration:
       partition_type: null
       business_key_columns:
         - id
+      column_defaults: {}
       enabled: true

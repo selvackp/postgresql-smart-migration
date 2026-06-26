@@ -20,7 +20,7 @@ migration:
   max_retries: 1
   checkpoint_file: "migration_checkpoint.json"
   error_table: "migration_error_log"
-  timezone: "UTC"
+  timezone: "Asia/Kolkata"
   default_load_type: "incremental"
   stop_on_table_error: false
   create_missing_partitions: true

@@ -1,0 +1,64 @@
+# Postgres Smart Migration
+
+Production-ready PostgreSQL table migration runner for full loads and high-watermark incremental syncs.
+
+## Install
+
+```bash
+pip install -r requirements.txt
+python migration_sync.py --config config.yaml
+```
+
+## What it does
+
+- Runs full and incremental table loads.
+- Uses a high-watermark incremental window plus business-key ordering for resumable batches.
+- Writes checkpoints atomically to avoid corrupt checkpoint JSON.
+- Uses a PostgreSQL advisory lock to prevent overlapping runs.
+- Can disable and re-enable user triggers per table using `migration.disable_triggers_globally`.
+- Resets sequence-backed columns after successful full or incremental table loads using `pg_get_serial_sequence`.
+- Keeps UPSERT behavior using business keys and protects inserts with `ON CONFLICT DO NOTHING`.
+- Auto-detects a primary key or unique key when `business_key_columns` is not configured.
+- Creates missing range/list partitions when configured.
+- Validates NOT NULL values, string length, JSON/JSONB values, and array literals.
+- Logs bad rows into `migration_error_log`.
+- Continues other tables after a table failure when `stop_on_table_error: false`.
+
+## Configuration Notes
+
+The main settings live under `migration`.
+
+- `batch_size`: rows per batch.
+- `checkpoint_file`: JSON checkpoint path.
+- `error_table`: target-side bad-row table name.
+- `disable_triggers_globally`: disables user triggers during each table load unless a table overrides it with `disable_triggers_during_load`.
+- `reset_sequences`: resets serial/bigserial/identity-backed sequences after each successful table load.
+- `stop_on_table_error`: when `false`, one table failure is logged and the next table continues.
+- `business_key_columns`: optional; if omitted, the script detects target PK, source PK, target unique key, then source unique key.
+- `partition_type`: set to `range` or `list` with `partition_column` to create missing partitions.
+
+For incremental loads, each table must set `incremental_column`.
+
+## Checkpoints
+
+Checkpoints store:
+
+- `last_incremental_value`
+- `last_key_values`
+- `high_watermark`
+- `total_rows`
+- `status`
+- `business_key_columns`
+
+Old checkpoints with a mismatched business-key definition are ignored for that table.
+
+## Validation SQL
+
+The `sql/` folder contains helper scripts:
+
+- `01_error_log_summary.sql`
+- `02_disabled_triggers.sql`
+- `03_sequence_health.sql`
+- `04_table_row_counts.sql`
+
+Run them against the target database after migration.

@@ -1,0 +1,46 @@
+source:
+  host: ""
+  port: 58311
+  database: ""
+  user: ""
+  password: ""
+  schema: "public"
+
+target:
+  host: ""
+  port: 58311
+  database: ""
+  user: ""
+  password: ""
+  schema: "public"
+
+migration:
+  batch_size: 20000
+  sleep_seconds: 2
+  max_retries: 1
+  checkpoint_file: "migration_checkpoint.json"
+  error_table: "migration_error_log"
+  timezone: "UTC"
+  default_load_type: "incremental"
+  stop_on_table_error: false
+  create_missing_partitions: true
+  disable_triggers_globally: true
+  partition_granularity: "daily"   # daily or monthly
+  validate_lengths: true
+  validate_not_null: true
+  skip_bad_rows: true
+  use_advisory_lock: true
+  advisory_lock_key: 987654321
+  reset_sequences: true
+  check_disabled_triggers_after_run: true
+
+  tables:
+    - source_table: oauth_client_details
+      target_table: oauth_client_details
+      load_type: incremental
+      incremental_column: crtdate
+      partition_column: null
+      partition_type: null
+      business_key_columns:
+        - client_id
+      enabled: true

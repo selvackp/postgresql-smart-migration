@@ -452,7 +452,7 @@ def validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_c
             if validation_error:
                 errors.append(validation_error)
         if errors:
-            business_key = "|".join(str(row[i]) for i in key_indexes)
+            business_key = "|".join(str(row_dict.get(c)) for c in business_key_columns)
             bad_rows.append({"business_key": business_key, "error_message": "; ".join(errors), "row_data": row_dict})
             if not skip_bad_rows: raise Exception(f"Bad row found for key {business_key}: {'; '.join(errors)}")
         else:
@@ -718,15 +718,15 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                     break
                 except Exception as e:
                     target_conn.rollback(); retry_count += 1
-                    logging.error(f"[{target_table}] Retry {retry_count}/{m['max_retries']} failed: {e}")
+                    logging.exception(f"[{target_table}] Retry {retry_count}/{m['max_retries']} failed: {e}")
                     time.sleep(10)
                     if retry_count == m["max_retries"]:
                         checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value), "last_key_values": [str(v) for v in last_key_values], "high_watermark": str(high_watermark), "total_rows": total_rows, "status": "FAILED", "load_type": load_type, "business_key_columns": business_key_columns, "error": str(e)}
                         write_checkpoint(m["checkpoint_file"], checkpoint_data); raise e
-            key_indexes = [columns.index(c) for c in business_key_columns]
             last_row = rows[-1]
-            last_key_values = [last_row[i] for i in key_indexes]
-            if load_type == "incremental": last_incremental_value = last_row[columns.index(incremental_column)]
+            last_row_dict = dict(zip(columns, last_row))
+            last_key_values = [last_row_dict[c] for c in business_key_columns]
+            if load_type == "incremental": last_incremental_value = last_row_dict[incremental_column]
             total_rows += len(rows)
             checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value), "last_key_values": [str(v) for v in last_key_values], "high_watermark": str(high_watermark), "total_rows": total_rows, "status": "RUNNING", "load_type": load_type, "business_key_columns": business_key_columns}
             write_checkpoint(m["checkpoint_file"], checkpoint_data)
@@ -954,7 +954,7 @@ def main():
                     "error": str(e)
                 })
 
-                logging.error(f"[{table_name}] Table migration failed: {e}")
+                logging.exception(f"[{table_name}] Table migration failed: {e}")
 
                 if cfg["migration"].get("stop_on_table_error", False):
                     raise e

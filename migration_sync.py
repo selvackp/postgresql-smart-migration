@@ -309,7 +309,24 @@ def log_bad_rows(target_conn, target_schema, error_table, table_name, bad_rows):
     if not bad_rows: return
     insert_sql = sql.SQL("INSERT INTO {schema}.{error_table} (table_name,business_key,error_message,row_data) VALUES %s").format(
         schema=sql.Identifier(target_schema), error_table=sql.Identifier(error_table))
-    values = [(table_name, x["business_key"], x["error_message"], Json(x["row_data"])) for x in bad_rows]
+    def json_default(value):
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value).hex()
+        return str(value)
+
+    values = [
+        (
+            table_name,
+            x["business_key"],
+            x["error_message"],
+            Json(x["row_data"], dumps=lambda obj: json.dumps(obj, default=json_default)),
+        )
+        for x in bad_rows
+    ]
     with target_conn.cursor() as cur: execute_values(cur, insert_sql.as_string(target_conn), values)
     target_conn.commit()
 

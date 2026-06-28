@@ -21,7 +21,7 @@ python migration_sync.py --config config.yaml
 - Auto-detects a primary key or unique key when `business_key_columns` is not configured.
 - Creates missing range/list partitions when configured.
 - Validates NOT NULL values, string length, JSON/JSONB values, and array literals.
-- Logs bad rows into `migration_error_log`.
+- Logs bad rows into `migration_error_log`; numeric/decimal values are stored as strings, dates/timestamps as ISO text, and binary values as hexadecimal in `row_data` JSON.
 - Continues other tables after a table failure when `stop_on_table_error: false`.
 
 ## Configuration Notes
@@ -63,6 +63,10 @@ Checkpoints store:
 - `business_key_columns`
 
 Old checkpoints with a mismatched business-key definition are ignored for that table.
+
+If a run stops unexpectedly, committed batches remain in the target and the next run resumes from the last atomic checkpoint. A batch committed immediately before its checkpoint update may be replayed; UPSERT/`ON CONFLICT` handling makes that replay safe when the configured business key is backed by a reliable unique constraint.
+
+When `disable_triggers_globally: true`, normal exceptions re-enable triggers in cleanup. A forced process or server termination can leave table triggers disabled because `ALTER TABLE ... DISABLE TRIGGER USER` is persistent. Run `sql/02_disabled_triggers.sql` before restarting and re-enable any affected triggers.
 
 ## Validation SQL
 

@@ -30,6 +30,7 @@ migration:
   validate_not_null: true
   truncate_long_strings: false
   skip_bad_rows: true
+  fail_on_error_log_failure: false
   use_advisory_lock: true
   advisory_lock_key: 987654321
   reset_sequences: true

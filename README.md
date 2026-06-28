@@ -21,7 +21,7 @@ python migration_sync.py --config config.yaml
 - Auto-detects a primary key or unique key when `business_key_columns` is not configured.
 - Creates missing range/list partitions when configured.
 - Validates NOT NULL values, string length, JSON/JSONB values, and array literals.
-- Logs bad rows into `migration_error_log`; numeric/decimal values are stored as strings, dates/timestamps as ISO text, and binary values as hexadecimal in `row_data` JSON.
+- Logs bad rows into `migration_error_log`; numeric/decimal values are stored as strings, dates/timestamps as ISO text, UUIDs as strings, and binary values as Base64 text in `row_data` JSON.
 - Continues other tables after a table failure when `stop_on_table_error: false`.
 
 ## Configuration Notes
@@ -31,6 +31,7 @@ The main settings live under `migration`.
 - `batch_size`: rows per batch.
 - `checkpoint_file`: JSON checkpoint path.
 - `error_table`: target-side bad-row table name.
+- `fail_on_error_log_failure`: when `false` (default), a failure writing to the error table is logged and migration continues; set to `true` to fail the table.
 - `timezone`: database session timezone used while reading/writing timestamps. The example uses `Asia/Kolkata`; use `UTC` if your migration convention is UTC.
 - `disable_triggers_globally`: disables user triggers during each table load unless a table overrides it with `disable_triggers_during_load`.
 - `reset_sequences`: resets serial/bigserial/identity-backed sequences after each successful table load.

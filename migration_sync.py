@@ -7,8 +7,10 @@ import yaml
 import logging
 import ast
 import argparse
+import base64
 from datetime import datetime, timedelta, date
 from decimal import Decimal
+from uuid import UUID
 
 import psycopg2
 from psycopg2 import sql
@@ -305,30 +307,50 @@ def create_error_table(target_conn, target_schema, error_table):
     target_conn.commit()
 
 
-def log_bad_rows(target_conn, target_schema, error_table, table_name, bad_rows):
-    if not bad_rows: return
-    insert_sql = sql.SQL("INSERT INTO {schema}.{error_table} (table_name,business_key,error_message,row_data) VALUES %s").format(
-        schema=sql.Identifier(target_schema), error_table=sql.Identifier(error_table))
-    def json_default(value):
-        if isinstance(value, Decimal):
-            return str(value)
-        if isinstance(value, (datetime, date)):
-            return value.isoformat()
-        if isinstance(value, (bytes, bytearray, memoryview)):
-            return bytes(value).hex()
+def json_safe_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
         return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_value(item) for item in value]
+    return str(value)
 
-    values = [
-        (
-            table_name,
-            x["business_key"],
-            x["error_message"],
-            Json(x["row_data"], dumps=lambda obj: json.dumps(obj, default=json_default)),
-        )
-        for x in bad_rows
-    ]
-    with target_conn.cursor() as cur: execute_values(cur, insert_sql.as_string(target_conn), values)
-    target_conn.commit()
+
+def log_bad_rows(target_conn, target_schema, error_table, table_name, bad_rows, fail_on_error=False):
+    if not bad_rows:
+        return
+    try:
+        insert_sql = sql.SQL("INSERT INTO {schema}.{error_table} (table_name,business_key,error_message,row_data) VALUES %s").format(
+            schema=sql.Identifier(target_schema), error_table=sql.Identifier(error_table))
+        values = [
+            (
+                table_name,
+                x["business_key"],
+                x["error_message"],
+                Json(json_safe_value(x["row_data"])),
+            )
+            for x in bad_rows
+        ]
+        with target_conn.cursor() as cur:
+            execute_values(cur, insert_sql.as_string(target_conn), values)
+        target_conn.commit()
+    except Exception as e:
+        logging.exception(f"[{table_name}] Failed to write {len(bad_rows)} bad row(s) to {error_table}: {e}")
+        try:
+            target_conn.rollback()
+        except Exception:
+            logging.exception(f"[{table_name}] Failed to roll back error-log transaction")
+        if fail_on_error:
+            raise
 
 
 def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
@@ -470,8 +492,9 @@ def validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_c
                 errors.append(validation_error)
         if errors:
             business_key = "|".join(str(row_dict.get(c)) for c in business_key_columns)
-            bad_rows.append({"business_key": business_key, "error_message": "; ".join(errors), "row_data": row_dict})
-            if not skip_bad_rows: raise Exception(f"Bad row found for key {business_key}: {'; '.join(errors)}")
+            error_message = "; ".join(errors)
+            bad_rows.append({"business_key": business_key, "error_message": error_message, "row_data": row_dict})
+            if not skip_bad_rows: raise Exception(f"Bad row found for key {business_key}: {error_message}")
         else:
             good_rows.append(tuple(row_dict[c] for c in columns))
     return good_rows, bad_rows
@@ -728,7 +751,20 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         write_checkpoint(m["checkpoint_file"], checkpoint_data); logging.info(f"[{target_table}] No rows found. Status={final_status}"); return
                     good_rows, bad_rows = validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_cfg)
                     if bad_rows:
-                        log_bad_rows(target_conn, target_schema, m["error_table"], target_table, bad_rows); logging.warning(f"[{target_table}] Bad rows skipped: {len(bad_rows)}")
+                        for bad_row in bad_rows:
+                            logging.error(
+                                f"[{target_table}] Bad row: key={bad_row['business_key']}, "
+                                f"error={bad_row['error_message']}"
+                            )
+                        log_bad_rows(
+                            target_conn,
+                            target_schema,
+                            m["error_table"],
+                            target_table,
+                            bad_rows,
+                            fail_on_error=m.get("fail_on_error_log_failure", False),
+                        )
+                        logging.warning(f"[{target_table}] Bad rows skipped: {len(bad_rows)}")
                     if good_rows:
                         truncate_temp(target_conn, temp_table); copy_to_temp(target_conn, temp_table, columns, good_rows)
                         merge_from_temp_business_key(target_conn, target_schema, target_table, temp_table, columns, business_key_columns, incremental_column, load_type)

@@ -726,8 +726,9 @@ def copy_to_temp(target_conn, temp_table, columns, rows):
         writer.writerow(["\\N" if value is None else value for value in row])
     buffer.seek(0)
     col_sql = ", ".join([f'"{c}"' for c in columns])
+    copy_sql = f"COPY \"{temp_table}\" ({col_sql}) FROM STDIN WITH CSV NULL '\\N'"
     with target_conn.cursor() as cur:
-        cur.copy_expert(f'COPY "{temp_table}" ({col_sql}) FROM STDIN WITH CSV NULL ''\\N''', buffer)
+        cur.copy_expert(copy_sql, buffer)
 
 def merge_from_temp_business_key(target_conn, target_schema, target_table, temp_table, columns, business_key_columns, incremental_column, load_type):
     update_columns = [c for c in columns if c not in business_key_columns]

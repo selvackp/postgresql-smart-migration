@@ -97,7 +97,7 @@ All keys below belong under `migration`.
 | `business_key_columns` | Auto-detected | Stable columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. Required for incremental, optional for full load. |
 | `partition_column` | `null` | Target partition key. Use `null` for a non-partitioned target. The column must exist in source and target. |
 | `partition_type` | `null` | `range`, `list`, or `null`. Must match the target parent's PostgreSQL partition strategy. |
-| `column_defaults` | `{}` | Values applied when a source value is NULL before target NOT NULL validation. |
+| `column_defaults` | `{}` | Values applied when a source value is NULL, and also used for target-only columns that are not present in the source. |
 | `skip_bad_rows` | Global setting | Optional table override for bad-row behavior. |
 | `disable_triggers_during_load` | Global setting | Optional table override for trigger disable/enable behavior. |
 
@@ -195,7 +195,7 @@ The target parent table must already exist with PostgreSQL `PARTITION BY RANGE (
 
 ### Validation and defaults
 
-`column_defaults` values are applied only when the source value is NULL. Values must be compatible with the target column type:
+`column_defaults` values are applied when the source value is NULL. They can also fill target-only columns that do not exist in the source table. Values must be compatible with the target column type:
 
 ```yaml
 column_defaults:
@@ -204,7 +204,7 @@ column_defaults:
   processed_at: "2026-01-01 00:00:00"
 ```
 
-Pre-migration validation checks table existence, common columns, incremental/business/partition columns, and datatype compatibility. Row validation covers target NOT NULL constraints, string lengths, JSON/JSONB, and arrays. Rejected row payloads are written to `migration_error_log` using JSON-safe representations.
+Pre-migration validation checks table existence, common columns, incremental/business/partition columns, and datatype compatibility. Target-only columns are skipped when nullable or when the target database has its own default/identity value. A target-only `NOT NULL` column without a database default must be provided in `column_defaults`, otherwise the table is skipped with a clear validation error. Row validation covers target NOT NULL constraints, string lengths, JSON/JSONB, and arrays. Rejected row payloads are written to `migration_error_log` using JSON-safe representations.
 ## Checkpoints
 
 Checkpoints store:

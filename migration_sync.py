@@ -99,7 +99,8 @@ def parse_value(value):
 def get_table_columns(conn, schema_name, table_name):
     query = """
         SELECT column_name, data_type, udt_name, character_maximum_length,
-               numeric_precision, numeric_scale, is_nullable
+               numeric_precision, numeric_scale, is_nullable,
+               column_default, is_identity
         FROM information_schema.columns
         WHERE table_schema = %s AND table_name = %s
         ORDER BY ordinal_position
@@ -107,8 +108,19 @@ def get_table_columns(conn, schema_name, table_name):
     with conn.cursor() as cur:
         cur.execute(query, (schema_name, table_name))
         rows = cur.fetchall()
-    return {r[0]: {"data_type": r[1], "udt_name": r[2], "max_length": r[3], "numeric_precision": r[4], "numeric_scale": r[5], "is_nullable": r[6]} for r in rows}
-
+    return {
+        r[0]: {
+            "data_type": r[1],
+            "udt_name": r[2],
+            "max_length": r[3],
+            "numeric_precision": r[4],
+            "numeric_scale": r[5],
+            "is_nullable": r[6],
+            "column_default": r[7],
+            "is_identity": r[8],
+        }
+        for r in rows
+    }
 
 def get_primary_key_columns(conn, schema_name, table_name):
     query = """
@@ -353,18 +365,48 @@ def log_bad_rows(target_conn, target_schema, error_table, table_name, bad_rows, 
             raise
 
 
+def target_has_database_default(meta):
+    return meta.get("column_default") is not None or meta.get("is_identity") == "YES"
+
+
 def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
     source_schema, target_schema = cfg["source"]["schema"], cfg["target"]["schema"]
     source_table, target_table = table_cfg["source_table"], table_cfg["target_table"]
     source_meta, target_meta = get_table_columns(source_conn, source_schema, source_table), get_table_columns(target_conn, target_schema, target_table)
     if not source_meta: raise PreMigrationValidationError(f"[{target_table}] Source table not found: {source_schema}.{source_table}")
     if not target_meta: raise PreMigrationValidationError(f"[{target_table}] Target table not found: {target_schema}.{target_table}")
-    common_columns = [c for c in target_meta.keys() if c in source_meta.keys()]
-    if not common_columns: raise PreMigrationValidationError(f"[{target_table}] No common columns found")
-    validate_datatype_compatibility(source_meta, target_meta, common_columns, target_table)
+    source_columns = [c for c in target_meta.keys() if c in source_meta.keys()]
+    if not source_columns: raise PreMigrationValidationError(f"[{target_table}] No common columns found")
+    validate_datatype_compatibility(source_meta, target_meta, source_columns, target_table)
+
+    column_defaults = table_cfg.get("column_defaults") or {}
+    unknown_defaults = [c for c in column_defaults if c not in target_meta]
+    if unknown_defaults:
+        raise PreMigrationValidationError(f"[{target_table}] column_defaults configured for target columns that do not exist: {unknown_defaults}")
+
+    target_only_columns = [c for c in target_meta.keys() if c not in source_meta]
+    missing_required_columns = [
+        c for c in target_only_columns
+        if target_meta[c]["is_nullable"] == "NO"
+        and c not in column_defaults
+        and not target_has_database_default(target_meta[c])
+    ]
+    if missing_required_columns:
+        raise PreMigrationValidationError(
+            f"[{target_table}] Target NOT NULL columns missing from source and without DB/config default: {missing_required_columns}"
+        )
+
+    target_columns = [
+        c for c in target_meta.keys()
+        if c in source_meta or (c in column_defaults and not target_has_database_default(target_meta[c]))
+    ]
+    default_only_columns = [c for c in target_columns if c not in source_meta]
+    if default_only_columns:
+        logging.info(f"[{target_table}] Target-only columns filled from column_defaults: {default_only_columns}")
+
     incremental_column = table_cfg.get("incremental_column")
     if load_type == "incremental" and not incremental_column: raise PreMigrationValidationError(f"[{target_table}] incremental_column is required for incremental load")
-    if incremental_column and incremental_column not in common_columns: raise PreMigrationValidationError(f"[{target_table}] incremental_column {incremental_column} not found in source and target")
+    if incremental_column and incremental_column not in source_columns: raise PreMigrationValidationError(f"[{target_table}] incremental_column {incremental_column} not found in source and target")
     try:
         business_key_columns = detect_business_key(source_conn, target_conn, cfg, table_cfg)
     except Exception as e:
@@ -378,17 +420,17 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
             raise PreMigrationValidationError(str(e))
 
     for key_col in business_key_columns:
-        if key_col not in common_columns:
+        if key_col not in source_columns:
             raise PreMigrationValidationError(
                 f"[{target_table}] Business key {key_col} not found in source and target"
             )
     partition_column = table_cfg.get("partition_column")
-    if partition_column and partition_column not in common_columns: raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} not found in source and target")
-    logging.info(f"[{target_table}] Auto mapped columns: {common_columns}")
+    if partition_column and partition_column not in source_columns: raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} not found in source and target")
+    logging.info(f"[{target_table}] Source mapped columns: {source_columns}")
+    logging.info(f"[{target_table}] Target load columns: {target_columns}")
     logging.info(f"[{target_table}] Business key columns: {business_key_columns}")
     logging.info(f"[{target_table}] Load type: {load_type}")
-    return common_columns, source_meta, target_meta, business_key_columns
-
+    return source_columns, target_columns, source_meta, target_meta, business_key_columns
 
 def is_array_column(meta):
     return meta.get("data_type") == "ARRAY" or str(meta.get("udt_name", "")).startswith("_")
@@ -456,37 +498,35 @@ def is_limited_string_column(meta):
 def apply_column_defaults(row_dict, table_cfg):
     defaults = table_cfg.get("column_defaults") or {}
     for col, default_value in defaults.items():
-        if col in row_dict and row_dict[col] is None:
+        if col not in row_dict or row_dict[col] is None:
             row_dict[col] = default_value
     return row_dict
 
 
-def normalize_row_for_target(row, columns, target_meta, table_cfg):
-    row_dict = apply_column_defaults(dict(zip(columns, row)), table_cfg)
+def normalize_row_for_target(row, source_columns, target_columns, target_meta, table_cfg):
+    row_dict = apply_column_defaults(dict(zip(source_columns, row)), table_cfg)
     normalized = []
-    for col in columns:
-        value, meta = row_dict[col], target_meta[col]
+    for col in target_columns:
+        value, meta = row_dict.get(col), target_meta[col]
         if meta["data_type"] in JSON_TYPES: value = normalize_json_value(value)
         elif is_array_column(meta): value = normalize_array_value(value)
         normalized.append(value)
     return tuple(normalized)
 
 
-def validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_cfg):
+def validate_rows(rows, source_columns, target_columns, target_meta, business_key_columns, cfg, table_cfg):
     validate_lengths = cfg["migration"].get("validate_lengths", True)
     validate_not_null = cfg["migration"].get("validate_not_null", True)
     truncate_long_strings = cfg["migration"].get("truncate_long_strings", False)
     skip_bad_rows = table_cfg.get("skip_bad_rows", cfg["migration"].get("skip_bad_rows", True))
     good_rows, bad_rows = [], []
-    key_indexes = [columns.index(c) for c in business_key_columns]
     for row in rows:
         errors = []
         try:
-            normalized_row = normalize_row_for_target(row, columns, target_meta, table_cfg)
-            row_dict = dict(zip(columns, normalized_row))
+            normalized_row = normalize_row_for_target(row, source_columns, target_columns, target_meta, table_cfg)
+            row_dict = dict(zip(target_columns, normalized_row))
         except Exception as e:
-            row_dict = dict(zip(columns, row))
-            normalized_row = None
+            row_dict = apply_column_defaults(dict(zip(source_columns, row)), table_cfg)
             errors.append(str(e))
         for col, value in row_dict.items():
             meta = target_meta[col]
@@ -507,9 +547,8 @@ def validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_c
             bad_rows.append({"business_key": business_key, "error_message": error_message, "row_data": row_dict})
             if not skip_bad_rows: raise Exception(f"Bad row found for key {business_key}: {error_message}")
         else:
-            good_rows.append(tuple(row_dict[c] for c in columns))
+            good_rows.append(tuple(row_dict[c] for c in target_columns))
     return good_rows, bad_rows
-
 
 def normalize_date(value):
     if isinstance(value, datetime): return value.date()
@@ -736,7 +775,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
     if load_type == "skip": logging.info(f"[{target_table}] Skipped"); return
     if load_type not in ("full", "incremental"): raise Exception(f"[{target_table}] Invalid load_type: {load_type}")
     table_key, temp_table = f"{source_schema}.{source_table}_to_{target_schema}.{target_table}", f"tmp_migration_{target_table}"
-    columns, source_meta, target_meta, business_key_columns = prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type)
+    source_columns, target_columns, source_meta, target_meta, business_key_columns = prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type)
     ensure_partitions(source_conn, target_conn, cfg, table_cfg)
     if load_type == "incremental":
         min_value, max_value = get_min_max_column(source_conn, source_schema, source_table, incremental_column)
@@ -800,7 +839,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
             set_table_triggers(target_conn, target_schema, target_table, "DISABLE")
             triggers_disabled = True
             logging.info(f"[{target_table}] User triggers disabled")
-        create_temp_table(target_conn, target_schema, target_table, temp_table, columns)
+        create_temp_table(target_conn, target_schema, target_table, temp_table, target_columns)
         while True:
             retry_count = 0
             while retry_count < m["max_retries"]:
@@ -810,7 +849,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                             source_conn,
                             source_schema,
                             source_table,
-                            columns,
+                            source_columns,
                             m["batch_size"],
                             total_rows
                         )
@@ -819,7 +858,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                             source_conn,
                             source_schema,
                             source_table,
-                            columns,
+                            source_columns,
                             business_key_columns,
                             last_key_values,
                             m["batch_size"]
@@ -829,7 +868,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                             source_conn,
                             source_schema,
                             source_table,
-                            columns,
+                            source_columns,
                             incremental_column,
                             business_key_columns,
                             last_incremental_value,
@@ -841,7 +880,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         final_status = "WAITING_FOR_NEXT_RUN" if load_type == "incremental" else "COMPLETED"
                         checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value), "last_key_values": [str(v) for v in last_key_values], "high_watermark": str(high_watermark), "total_rows": total_rows, "status": final_status, "load_type": load_type, "business_key_columns": business_key_columns}
                         write_checkpoint(m["checkpoint_file"], checkpoint_data); logging.info(f"[{target_table}] No rows found. Status={final_status}"); return
-                    good_rows, bad_rows = validate_rows(rows, columns, target_meta, business_key_columns, cfg, table_cfg)
+                    good_rows, bad_rows = validate_rows(rows, source_columns, target_columns, target_meta, business_key_columns, cfg, table_cfg)
                     if bad_rows:
                         for bad_row in bad_rows:
                             logging.error(
@@ -858,14 +897,14 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         )
                         logging.warning(f"[{target_table}] Bad rows skipped: {len(bad_rows)}")
                     if good_rows:
-                        truncate_temp(target_conn, temp_table); copy_to_temp(target_conn, temp_table, columns, good_rows)
+                        truncate_temp(target_conn, temp_table); copy_to_temp(target_conn, temp_table, target_columns, good_rows)
                         if load_type == "full" and not business_key_columns:
                             insert_from_temp_only(
                                 target_conn,
                                 target_schema,
                                 target_table,
                                 temp_table,
-                                columns
+                                target_columns
                             )
                         else:
                             merge_from_temp_business_key(
@@ -873,7 +912,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                                 target_schema,
                                 target_table,
                                 temp_table,
-                                columns,
+                                target_columns,
                                 business_key_columns,
                                 incremental_column,
                                 load_type
@@ -887,7 +926,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value), "last_key_values": [str(v) for v in last_key_values], "high_watermark": str(high_watermark), "total_rows": total_rows, "status": "FAILED", "load_type": load_type, "business_key_columns": business_key_columns, "error": str(e)}
                         write_checkpoint(m["checkpoint_file"], checkpoint_data); raise e
             last_row = rows[-1]
-            last_row_dict = dict(zip(columns, last_row))
+            last_row_dict = dict(zip(source_columns, last_row))
             last_key_values = [last_row_dict[c] for c in business_key_columns] if business_key_columns else []
             if load_type == "incremental":
                 last_incremental_value = last_row_dict[incremental_column]

@@ -92,16 +92,16 @@ All keys below belong under `migration`.
 | `source_table` | Required | Source table name in `source.schema`. |
 | `target_table` | Required | Target table name in `target.schema`. Names may differ. |
 | `enabled` | `true` | Set `false` to skip this table without deleting its configuration. |
-| `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Both modes merge by business key. Full load does not truncate the target. |
+| `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Incremental requires a business/PK/unique key. Full load merges by key when one exists, or uses insert-only mode when no key exists. Full load does not truncate the target. |
 | `incremental_column` | Incremental only | Source/target column used for high-watermark ordering, such as `updated_at` or `crtdate`. NULL values are not selected. |
-| `business_key_columns` | Auto-detected | Stable columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. |
+| `business_key_columns` | Auto-detected | Stable columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. Required for incremental, optional for full load. |
 | `partition_column` | `null` | Target partition key. Use `null` for a non-partitioned target. The column must exist in source and target. |
 | `partition_type` | `null` | `range`, `list`, or `null`. Must match the target parent's PostgreSQL partition strategy. |
 | `column_defaults` | `{}` | Values applied when a source value is NULL before target NOT NULL validation. |
 | `skip_bad_rows` | Global setting | Optional table override for bad-row behavior. |
 | `disable_triggers_during_load` | Global setting | Optional table override for trigger disable/enable behavior. |
 
-Business keys should be non-NULL and backed by a target primary-key or unique constraint. This makes checkpoint replay and `ON CONFLICT` handling reliable.
+Business keys should be non-NULL and backed by a target primary-key or unique constraint. This makes checkpoint replay and `ON CONFLICT` handling reliable. For `load_type: full` tables without any key, the script uses insert-only mode with `OFFSET`-based batching; use it for stable source tables, and preferably start from an empty target to avoid duplicates when no target unique constraint exists.
 
 ### Table examples
 
@@ -136,6 +136,20 @@ Full UPSERT into a non-partitioned target:
 ```
 
 A completed full load is skipped on later runs while its checkpoint status is `COMPLETED`. Remove only that table's checkpoint entry when an intentional full rerun is required.
+
+Full insert-only load without a business key:
+
+```yaml
+- source_table: audit_archive
+  target_table: audit_archive
+  enabled: true
+  load_type: full
+  partition_column: null
+  partition_type: null
+  column_defaults: {}
+```
+
+This mode is useful when the source and target table have no PK/unique/business key. Because there is no stable keyset cursor, checkpoint resume uses the completed row count as an offset.
 
 Non-partitioned source into a range-partitioned target:
 

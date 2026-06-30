@@ -204,7 +204,7 @@ column_defaults:
   processed_at: "2026-01-01 00:00:00"
 ```
 
-Pre-migration validation checks table existence, common columns, incremental/business/partition columns, and datatype compatibility. Target-only columns are skipped when nullable or when the target database has its own default/identity value. A target-only `NOT NULL` column without a database default must be provided in `column_defaults`, otherwise the table is skipped with a clear validation error. Row validation covers target NOT NULL constraints, string lengths, JSON/JSONB, and arrays. Rejected row payloads are written to `migration_error_log` using JSON-safe representations.
+Pre-migration validation checks table existence, common columns, incremental/business/partition columns, and datatype compatibility. Target-only columns are skipped when nullable or when the target database has its own default/identity value. Target `GENERATED ALWAYS` identity columns are skipped even when the source has the same column, so PostgreSQL can assign the identity value. A target-only `NOT NULL` column without a database default must be provided in `column_defaults`, otherwise the table is skipped with a clear validation error. Row validation covers target NOT NULL constraints, string lengths, JSON/JSONB, and arrays. Rejected row payloads are written to `migration_error_log` using JSON-safe representations.
 ## Checkpoints
 
 Checkpoints store:
@@ -232,3 +232,4 @@ The `sql/` folder contains helper scripts:
 - `04_table_row_counts.sql`
 
 Run them against the target database after migration.
+

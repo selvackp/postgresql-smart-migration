@@ -100,7 +100,7 @@ def get_table_columns(conn, schema_name, table_name):
     query = """
         SELECT column_name, data_type, udt_name, character_maximum_length,
                numeric_precision, numeric_scale, is_nullable,
-               column_default, is_identity
+               column_default, is_identity, identity_generation
         FROM information_schema.columns
         WHERE table_schema = %s AND table_name = %s
         ORDER BY ordinal_position
@@ -118,6 +118,7 @@ def get_table_columns(conn, schema_name, table_name):
             "is_nullable": r[6],
             "column_default": r[7],
             "is_identity": r[8],
+            "identity_generation": r[9],
         }
         for r in rows
     }
@@ -369,6 +370,10 @@ def target_has_database_default(meta):
     return meta.get("column_default") is not None or meta.get("is_identity") == "YES"
 
 
+def is_generated_always_identity(meta):
+    return meta.get("is_identity") == "YES" and str(meta.get("identity_generation") or "").upper() == "ALWAYS"
+
+
 def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
     source_schema, target_schema = cfg["source"]["schema"], cfg["target"]["schema"]
     source_table, target_table = table_cfg["source_table"], table_cfg["target_table"]
@@ -384,6 +389,7 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
     if unknown_defaults:
         raise PreMigrationValidationError(f"[{target_table}] column_defaults configured for target columns that do not exist: {unknown_defaults}")
 
+    generated_always_columns = [c for c, meta in target_meta.items() if is_generated_always_identity(meta)]
     target_only_columns = [c for c in target_meta.keys() if c not in source_meta]
     missing_required_columns = [
         c for c in target_only_columns
@@ -398,15 +404,22 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
 
     target_columns = [
         c for c in target_meta.keys()
-        if c in source_meta or (c in column_defaults and not target_has_database_default(target_meta[c]))
+        if not is_generated_always_identity(target_meta[c])
+        and (c in source_meta or (c in column_defaults and not target_has_database_default(target_meta[c])))
     ]
     default_only_columns = [c for c in target_columns if c not in source_meta]
     if default_only_columns:
         logging.info(f"[{target_table}] Target-only columns filled from column_defaults: {default_only_columns}")
+    skipped_identity_columns = [c for c in generated_always_columns if c in source_meta or c in column_defaults]
+    if skipped_identity_columns:
+        logging.info(f"[{target_table}] Skipping GENERATED ALWAYS identity columns so PostgreSQL can assign values: {skipped_identity_columns}")
 
     incremental_column = table_cfg.get("incremental_column")
     if load_type == "incremental" and not incremental_column: raise PreMigrationValidationError(f"[{target_table}] incremental_column is required for incremental load")
     if incremental_column and incremental_column not in source_columns: raise PreMigrationValidationError(f"[{target_table}] incremental_column {incremental_column} not found in source and target")
+    if incremental_column and incremental_column in generated_always_columns:
+        raise PreMigrationValidationError(f"[{target_table}] incremental_column {incremental_column} is a target GENERATED ALWAYS identity column and cannot be loaded")
+    configured_business_key = bool(table_cfg.get("business_key_columns"))
     try:
         business_key_columns = detect_business_key(source_conn, target_conn, cfg, table_cfg)
     except Exception as e:
@@ -419,6 +432,19 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
         else:
             raise PreMigrationValidationError(str(e))
 
+    generated_identity_key_columns = [c for c in business_key_columns if c in generated_always_columns]
+    if generated_identity_key_columns:
+        if load_type == "full" and not configured_business_key:
+            logging.warning(
+                f"[{target_table}] Auto-detected key uses target GENERATED ALWAYS identity columns "
+                f"{generated_identity_key_columns}. Proceeding with full load using insert-only mode."
+            )
+            business_key_columns = []
+        else:
+            raise PreMigrationValidationError(
+                f"[{target_table}] Business key columns are target GENERATED ALWAYS identity columns and cannot be loaded: {generated_identity_key_columns}"
+            )
+
     for key_col in business_key_columns:
         if key_col not in source_columns:
             raise PreMigrationValidationError(
@@ -426,6 +452,8 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
             )
     partition_column = table_cfg.get("partition_column")
     if partition_column and partition_column not in source_columns: raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} not found in source and target")
+    if partition_column and partition_column in generated_always_columns:
+        raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} is a target GENERATED ALWAYS identity column and cannot be loaded")
     logging.info(f"[{target_table}] Source mapped columns: {source_columns}")
     logging.info(f"[{target_table}] Target load columns: {target_columns}")
     logging.info(f"[{target_table}] Business key columns: {business_key_columns}")
@@ -1205,3 +1233,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+

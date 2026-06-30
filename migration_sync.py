@@ -142,23 +142,31 @@ def get_primary_key_columns(conn, schema_name, table_name):
 
 def get_unique_key_columns(conn, schema_name, table_name):
     query = """
-        SELECT tc.constraint_name, array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS cols
-        FROM information_schema.table_constraints tc
+        WITH selected_constraint AS (
+            SELECT tc.constraint_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+             AND tc.table_name = kcu.table_name
+            WHERE tc.constraint_type = 'UNIQUE'
+              AND tc.table_schema = %s
+              AND tc.table_name = %s
+            GROUP BY tc.constraint_name
+            ORDER BY count(*) ASC, tc.constraint_name
+            LIMIT 1
+        )
+        SELECT kcu.column_name
+        FROM selected_constraint sc
         JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-         AND tc.table_schema = kcu.table_schema
-         AND tc.table_name = kcu.table_name
-        WHERE tc.constraint_type = 'UNIQUE'
-          AND tc.table_schema = %s AND tc.table_name = %s
-        GROUP BY tc.constraint_name
-        ORDER BY count(*) ASC, tc.constraint_name
-        LIMIT 1
+          ON kcu.constraint_name = sc.constraint_name
+         AND kcu.table_schema = %s
+         AND kcu.table_name = %s
+        ORDER BY kcu.ordinal_position
     """
     with conn.cursor() as cur:
-        cur.execute(query, (schema_name, table_name))
-        row = cur.fetchone()
-    return list(row[1]) if row else []
-
+        cur.execute(query, (schema_name, table_name, schema_name, table_name))
+        return [r[0] for r in cur.fetchall()]
 
 def normalize_type_name(meta):
     data_type = meta["data_type"]

@@ -200,6 +200,8 @@ def is_type_compatible(source_meta, target_meta):
         ("real", "double precision"),
         ("character varying", "text"),
         ("character", "text"),
+        ("text", "character varying"),
+        ("text", "character"),
         ("timestamp without time zone", "timestamp with time zone"),
     }
     if (source_type, target_type) in compatible_pairs:

@@ -266,6 +266,18 @@ When `disable_triggers_globally: true`, the original state of each user trigger 
 
 The reconciliation report uses source and target `COUNT(*)` queries. These provide strong operational visibility but may take time on very large tables. For incremental loads, `SourceWindow` is the number of rows eligible from the starting checkpoint through the captured high watermark; total source/target difference is informational because updates do not increase target row count.
 
+## Production Run Checklist
+
+- Back up the target and test the complete YAML configuration in staging first.
+- Disable table entries whose source tables do not exist, and verify source/target schema names.
+- Use stable business keys that match the logical row identity; partitioned-table unique keys normally include the partition column.
+- Control application writes when `allow_incremental_without_target_unique_index: true` is used.
+- Reconcile source/target values that conflict with alternate target unique constraints; full load does not bypass uniqueness or truncate the target.
+- Remove only the affected table checkpoint before intentionally rerunning a completed full load.
+- Review failed/skipped tables, `Unaccounted`, `WindowDifference`, conflict-skipped rows, and `migration_error_log` after every run.
+- Confirm the disabled-trigger check is clean before returning the target to normal operation.
+- Verify sequence state directly with `SELECT last_value, is_called FROM schema.sequence_name`; `pg_sequences.last_value` can be NULL for users without sequence privileges.
+
 ## Validation SQL
 
 The `sql/` folder contains helper scripts:

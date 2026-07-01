@@ -1581,6 +1581,15 @@ def get_bad_row_count(conn, schema_name, error_table):
         return int(cur.fetchone()[0])
 
 
+def calculate_next_sequence_value(table_value, current_value, is_called, increment, start_value):
+    table_next = table_value + increment
+    if current_value is None:
+        current_next = start_value
+    else:
+        current_next = current_value + increment if is_called else current_value
+    return max(table_next, current_next) if increment > 0 else min(table_next, current_next)
+
+
 def reset_table_sequences(conn, schema_name, table_name):
     """
     Resets serial/bigserial/identity-backed sequences after full load.
@@ -1614,18 +1623,27 @@ def reset_table_sequences(conn, schema_name, table_name):
         metadata_query = """
             SELECT sequence_metadata.seqstart,
                    sequence_metadata.seqincrement,
-                   sequence_view.last_value
+                   sequence_schema.nspname,
+                   sequence_class.relname
             FROM pg_sequence sequence_metadata
             JOIN pg_class sequence_class ON sequence_class.oid = sequence_metadata.seqrelid
             JOIN pg_namespace sequence_schema ON sequence_schema.oid = sequence_class.relnamespace
-            LEFT JOIN pg_sequences sequence_view
-              ON sequence_view.schemaname = sequence_schema.nspname
-             AND sequence_view.sequencename = sequence_class.relname
             WHERE sequence_metadata.seqrelid = %s::regclass
         """
         with conn.cursor() as cur:
             cur.execute(metadata_query, (seq_name,))
-            seq_start, seq_increment, current_value = cur.fetchone()
+            metadata = cur.fetchone()
+        if not metadata:
+            raise RuntimeError(f"[{table_name}] Could not read metadata for sequence {seq_name}")
+        seq_start, seq_increment, seq_schema, seq_table = metadata
+
+        sequence_state_query = sql.SQL("SELECT last_value, is_called FROM {schema}.{sequence}").format(
+            schema=sql.Identifier(seq_schema),
+            sequence=sql.Identifier(seq_table),
+        )
+        with conn.cursor() as cur:
+            cur.execute(sequence_state_query)
+            current_value, is_called = cur.fetchone()
 
         aggregate = sql.SQL("MAX") if seq_increment > 0 else sql.SQL("MIN")
         value_query = sql.SQL("SELECT {aggregate}({col}) FROM {schema}.{table}").format(
@@ -1641,18 +1659,20 @@ def reset_table_sequences(conn, schema_name, table_name):
         if table_value is None:
             logging.info(f"[{table_name}] Sequence {seq_name} unchanged because the table is empty")
             continue
-        if current_value is None:
-            desired_value = table_value
-        elif seq_increment > 0:
-            desired_value = max(current_value, table_value)
-        else:
-            desired_value = min(current_value, table_value)
+        desired_value = calculate_next_sequence_value(
+            table_value,
+            current_value,
+            is_called,
+            seq_increment,
+            seq_start,
+        )
 
         with conn.cursor() as cur:
-            cur.execute("SELECT setval(%s::regclass, %s, true)", (seq_name, desired_value))
+            cur.execute("SELECT setval(%s::regclass, %s, false)", (seq_name, desired_value))
 
         logging.info(
-            f"[{table_name}] Sequence synchronized for {column_name}: {seq_name} -> {desired_value}"
+            f"[{table_name}] Sequence synchronized for {column_name}: "
+            f"{seq_name}, next value={desired_value}"
         )
 
     conn.commit()

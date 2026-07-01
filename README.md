@@ -86,7 +86,7 @@ All keys below belong under `migration`.
 | `fail_on_error_log_failure` | `false` | Continue when writing `migration_error_log` fails. Set `true` to fail the table instead. |
 | `use_advisory_lock` | `true` | Prevent concurrent runs against the same target database. |
 | `advisory_lock_key` | `987654321` | Signed bigint lock identifier. Use a stable, application-specific value. |
-| `reset_sequences` | `true` | Synchronize sequence-backed target columns after successful full and incremental loads without moving a live sequence backward. The table is briefly locked against concurrent writes while its maximum key and sequence value are reconciled. |
+| `reset_sequences` | `true` | Synchronize sequence-backed target columns after successful full and incremental loads. The sequence is stored with `is_called=false`, so its next value is at least the table maximum plus its configured increment, without moving a live sequence backward. The table is briefly locked against concurrent writes while values are reconciled. |
 | `check_disabled_triggers_after_run` | `true` | Report target USER triggers that remain disabled at the end of the run. |
 | `tables` | Required | List of per-table migration definitions. |
 

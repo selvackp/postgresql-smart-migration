@@ -37,6 +37,24 @@ class RowDatabaseError(Exception):
 
 
 class MigrationSafetyTests(unittest.TestCase):
+    def test_sequence_reset_uses_next_value_after_table_maximum(self):
+        self.assertEqual(
+            migration.calculate_next_sequence_value(100, 1, True, 1, 1),
+            101,
+        )
+
+    def test_sequence_reset_never_moves_live_sequence_backward(self):
+        self.assertEqual(
+            migration.calculate_next_sequence_value(100, 150, True, 1, 1),
+            151,
+        )
+
+    def test_descending_sequence_uses_value_below_table_minimum(self):
+        self.assertEqual(
+            migration.calculate_next_sequence_value(-100, -1, True, -1, -1),
+            -101,
+        )
+
     def test_duplicate_business_key_configuration_is_rejected(self):
         with self.assertRaises(migration.PreMigrationValidationError):
             migration.validate_business_key_safety(

@@ -1154,7 +1154,10 @@ def main():
 
             if load_type == "skip":
                 logging.info(f"[{table_name}] Skipped due to load_type=skip or enabled=false")
-                skipped_tables.append(table_name)
+                skipped_tables.append({
+                    "table": table_name,
+                    "reason": "load_type=skip or enabled=false"
+                })
                 continue
 
             try:
@@ -1185,7 +1188,10 @@ def main():
                 logging.error(f"[{table_name}] Pre-migration validation failed: {e}")
                 if cfg["migration"].get("stop_on_table_error", False):
                     raise e
-                skipped_tables.append(table_name)
+                skipped_tables.append({
+                    "table": table_name,
+                    "reason": str(e)
+                })
                 continue
 
             except Exception as e:
@@ -1222,6 +1228,9 @@ def main():
 
         for item in failed_tables:
             logging.error(f"FAILED TABLE: {item['table']} | ERROR: {item['error']}")
+
+        for item in skipped_tables:
+            logging.warning(f"SKIPPED TABLE: {item['table']} | REASON: {item['reason']}")
 
         logging.info("Migration sync completed")
 

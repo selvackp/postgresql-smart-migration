@@ -37,6 +37,35 @@ class RowDatabaseError(Exception):
 
 
 class MigrationSafetyTests(unittest.TestCase):
+    def test_source_key_without_unique_index_is_allowed_when_data_is_unique(self):
+        metadata = {"id": {"is_nullable": "NO"}}
+        with mock.patch.object(
+            migration, "has_matching_unique_index", side_effect=[False, True]
+        ), mock.patch.object(
+            migration, "source_business_key_has_duplicates", return_value=False
+        ):
+            migration.validate_business_key_safety(
+                object(), object(), "public", "public", "source_table", "target_table",
+                metadata, metadata, ["id"]
+            )
+
+    def test_nullable_source_key_is_rejected_when_data_contains_null(self):
+        source_metadata = {"id": {"is_nullable": "YES"}}
+        target_metadata = {"id": {"is_nullable": "NO"}}
+        with mock.patch.object(migration, "source_business_key_has_null", return_value=True):
+            with self.assertRaises(migration.PreMigrationValidationError):
+                migration.validate_business_key_safety(
+                    object(), object(), "public", "public", "source_table", "target_table",
+                    source_metadata, target_metadata, ["id"]
+                )
+
+    def test_date_to_timestamp_is_a_compatible_widening(self):
+        compatible = migration.is_type_compatible(
+            {"data_type": "date", "udt_name": "date"},
+            {"data_type": "timestamp without time zone", "udt_name": "timestamp"},
+        )
+        self.assertEqual(compatible, (True, True))
+
     def test_sequence_reset_uses_next_value_after_table_maximum(self):
         self.assertEqual(
             migration.calculate_next_sequence_value(100, 1, True, 1, 1),

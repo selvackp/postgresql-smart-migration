@@ -211,6 +211,39 @@ def has_matching_unique_index(conn, schema_name, table_name, business_key_column
                for columns in get_unique_indexes(conn, schema_name, table_name))
 
 
+def source_business_key_has_null(conn, schema_name, table_name, business_key_columns):
+    null_condition = sql.SQL(" OR ").join(
+        sql.SQL("{column} IS NULL").format(column=sql.Identifier(column))
+        for column in business_key_columns
+    )
+    query = sql.SQL("SELECT 1 FROM {schema}.{table} WHERE {condition} LIMIT 1").format(
+        schema=sql.Identifier(schema_name),
+        table=sql.Identifier(table_name),
+        condition=null_condition,
+    )
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return cur.fetchone() is not None
+
+
+def source_business_key_has_duplicates(conn, schema_name, table_name, business_key_columns):
+    key_columns = sql.SQL(", ").join(sql.Identifier(column) for column in business_key_columns)
+    query = sql.SQL("""
+        SELECT 1
+        FROM {schema}.{table}
+        GROUP BY {key_columns}
+        HAVING COUNT(*) > 1
+        LIMIT 1
+    """).format(
+        schema=sql.Identifier(schema_name),
+        table=sql.Identifier(table_name),
+        key_columns=key_columns,
+    )
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return cur.fetchone() is not None
+
+
 def validate_business_key_safety(
     source_conn,
     target_conn,
@@ -230,14 +263,32 @@ def validate_business_key_safety(
         )
     nullable_source = [c for c in business_key_columns if source_meta[c]["is_nullable"] != "NO"]
     nullable_target = [c for c in business_key_columns if target_meta[c]["is_nullable"] != "NO"]
-    if nullable_source or nullable_target:
+    if nullable_source and source_business_key_has_null(
+        source_conn, source_schema, source_table, business_key_columns
+    ):
         raise PreMigrationValidationError(
-            f"[{target_table}] Business keys must be NOT NULL. "
-            f"Nullable source keys={nullable_source}, nullable target keys={nullable_target}"
+            f"[{target_table}] Source business key {business_key_columns} contains NULL values"
+        )
+    if nullable_source:
+        logging.warning(
+            f"[{target_table}] Source business-key columns are nullable by schema but current data contains no NULL keys: {nullable_source}"
+        )
+    if nullable_target:
+        logging.warning(
+            f"[{target_table}] Target business-key columns are nullable by schema: {nullable_target}"
         )
     if not has_matching_unique_index(source_conn, source_schema, source_table, business_key_columns):
-        raise PreMigrationValidationError(
-            f"[{target_table}] Source business key {business_key_columns} is not backed by a non-partial unique index"
+        logging.warning(
+            f"[{target_table}] Source business key has no matching unique index; validating source data for duplicates"
+        )
+        if source_business_key_has_duplicates(
+            source_conn, source_schema, source_table, business_key_columns
+        ):
+            raise PreMigrationValidationError(
+                f"[{target_table}] Source business key {business_key_columns} contains duplicate values"
+            )
+        logging.warning(
+            f"[{target_table}] Source business key {business_key_columns} is unique in current data but is not index-backed"
         )
     if not has_matching_unique_index(target_conn, target_schema, target_table, business_key_columns):
         raise PreMigrationValidationError(
@@ -278,6 +329,8 @@ def is_type_compatible(source_meta, target_meta):
         ("character", "text"),
         ("text", "character varying"),
         ("text", "character"),
+        ("date", "timestamp without time zone"),
+        ("date", "timestamp with time zone"),
         ("timestamp without time zone", "timestamp with time zone"),
     }
     if (source_type, target_type) in compatible_pairs:

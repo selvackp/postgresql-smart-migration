@@ -90,6 +90,8 @@ All keys below belong under `migration`.
 | `check_disabled_triggers_after_run` | `true` | Report target USER triggers that remain disabled at the end of the run. |
 | `tables` | Required | List of per-table migration definitions. |
 
+Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema-qualified sequence owned by each serial, bigserial, or identity column. A manually assigned `nextval(...)` default must also have the correct `OWNED BY schema.table.column` relationship; otherwise PostgreSQL does not report it as the column's sequence and the migration logs that no sequence-backed column was found.
+
 ### Per-table settings
 
 | Key | Required/default | Meaning |

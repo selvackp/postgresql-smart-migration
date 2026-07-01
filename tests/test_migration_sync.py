@@ -134,6 +134,18 @@ class MigrationSafetyTests(unittest.TestCase):
             101,
         )
 
+    def test_sequence_reset_stores_visible_previous_value(self):
+        self.assertEqual(
+            migration.calculate_sequence_setval(101, 1, 1, 9223372036854775807),
+            (100, True),
+        )
+
+    def test_sequence_reset_uses_uncalled_state_at_sequence_boundary(self):
+        self.assertEqual(
+            migration.calculate_sequence_setval(1, 1, 1, 100),
+            (1, False),
+        )
+
     def test_sequence_reset_never_moves_live_sequence_backward(self):
         self.assertEqual(
             migration.calculate_next_sequence_value(100, 150, True, 1, 1),

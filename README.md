@@ -89,7 +89,7 @@ All keys below belong under `migration`.
 | `use_advisory_lock` | `true` | Prevent concurrent runs against the same target database. |
 | `advisory_lock_key` | `987654321` | Signed bigint lock identifier. Use a stable, application-specific value. |
 | `allow_incremental_without_target_unique_index` | `false` | Allow incremental merge without a target unique index after scanning current target data for duplicate business keys. This reduces safety against concurrent application writes and may be slower. A table can override this setting. |
-| `reset_sequences` | `true` | Synchronize sequence-backed target columns after successful full and incremental loads. The sequence is stored with `is_called=false`, so its next value is at least the table maximum plus its configured increment, without moving a live sequence backward. The table is briefly locked against concurrent writes while values are reconciled. |
+| `reset_sequences` | `true` | Synchronize sequence-backed target columns after successful full and incremental loads. The sequence normally stores the preceding value with `is_called=true`, making `pg_sequences.last_value` visible immediately while keeping the next generated value at least the table maximum plus its configured increment. Boundary cases use `is_called=false`. The table is briefly locked against concurrent writes while values are reconciled. |
 | `check_disabled_triggers_after_run` | `true` | Report target USER triggers that remain disabled at the end of the run. |
 | `tables` | Required | List of per-table migration definitions. |
 

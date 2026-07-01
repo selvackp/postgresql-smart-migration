@@ -1721,6 +1721,13 @@ def calculate_next_sequence_value(table_value, current_value, is_called, increme
     return max(table_next, current_next) if increment > 0 else min(table_next, current_next)
 
 
+def calculate_sequence_setval(next_value, increment, minimum_value, maximum_value):
+    previous_value = next_value - increment
+    if minimum_value <= previous_value <= maximum_value:
+        return previous_value, True
+    return next_value, False
+
+
 def reset_table_sequences(conn, schema_name, table_name):
     """
     Resets serial/bigserial/identity-backed sequences after full load.
@@ -1754,6 +1761,8 @@ def reset_table_sequences(conn, schema_name, table_name):
         metadata_query = """
             SELECT sequence_metadata.seqstart,
                    sequence_metadata.seqincrement,
+                   sequence_metadata.seqmin,
+                   sequence_metadata.seqmax,
                    sequence_schema.nspname,
                    sequence_class.relname
             FROM pg_sequence sequence_metadata
@@ -1766,7 +1775,7 @@ def reset_table_sequences(conn, schema_name, table_name):
             metadata = cur.fetchone()
         if not metadata:
             raise RuntimeError(f"[{table_name}] Could not read metadata for sequence {seq_name}")
-        seq_start, seq_increment, seq_schema, seq_table = metadata
+        seq_start, seq_increment, seq_min, seq_max, seq_schema, seq_table = metadata
 
         sequence_state_query = sql.SQL("SELECT last_value, is_called FROM {schema}.{sequence}").format(
             schema=sql.Identifier(seq_schema),
@@ -1797,13 +1806,23 @@ def reset_table_sequences(conn, schema_name, table_name):
             seq_increment,
             seq_start,
         )
+        stored_value, is_called_after_reset = calculate_sequence_setval(
+            desired_value,
+            seq_increment,
+            seq_min,
+            seq_max,
+        )
 
         with conn.cursor() as cur:
-            cur.execute("SELECT setval(%s::regclass, %s, false)", (seq_name, desired_value))
+            cur.execute(
+                "SELECT setval(%s::regclass, %s, %s)",
+                (seq_name, stored_value, is_called_after_reset),
+            )
 
         logging.info(
             f"[{table_name}] Sequence synchronized for {column_name}: "
-            f"{seq_name}, next value={desired_value}"
+            f"{seq_name}, stored value={stored_value}, next value={desired_value}, "
+            f"is_called={is_called_after_reset}"
         )
 
     conn.commit()

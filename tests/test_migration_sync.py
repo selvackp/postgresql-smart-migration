@@ -70,6 +70,33 @@ class MigrationSafetyTests(unittest.TestCase):
                     metadata, metadata, ["rptid"], load_type="incremental"
                 )
 
+    def test_incremental_load_can_opt_in_without_target_unique_index(self):
+        metadata = {"id": {"is_nullable": "NO"}}
+        with mock.patch.object(
+            migration, "has_matching_unique_index", side_effect=[True, False]
+        ), mock.patch.object(
+            migration, "source_business_key_has_duplicates", return_value=False
+        ):
+            migration.validate_business_key_safety(
+                object(), object(), "public", "public", "source_table", "target_table",
+                metadata, metadata, ["id"], load_type="incremental",
+                allow_incremental_without_target_unique_index=True,
+            )
+
+    def test_incremental_opt_in_rejects_existing_target_duplicates(self):
+        metadata = {"id": {"is_nullable": "NO"}}
+        with mock.patch.object(
+            migration, "has_matching_unique_index", side_effect=[True, False]
+        ), mock.patch.object(
+            migration, "source_business_key_has_duplicates", return_value=True
+        ):
+            with self.assertRaises(migration.PreMigrationValidationError):
+                migration.validate_business_key_safety(
+                    object(), object(), "public", "public", "source_table", "target_table",
+                    metadata, metadata, ["id"], load_type="incremental",
+                    allow_incremental_without_target_unique_index=True,
+                )
+
     def test_nullable_source_key_is_rejected_when_data_contains_null(self):
         source_metadata = {"id": {"is_nullable": "YES"}}
         target_metadata = {"id": {"is_nullable": "NO"}}

@@ -255,6 +255,7 @@ def validate_business_key_safety(
     target_meta,
     business_key_columns,
     load_type="incremental",
+    allow_incremental_without_target_unique_index=False,
 ):
     if not business_key_columns:
         return
@@ -292,10 +293,24 @@ def validate_business_key_safety(
             f"[{target_table}] Source business key {business_key_columns} is unique in current data but is not index-backed"
         )
     if not has_matching_unique_index(target_conn, target_schema, target_table, business_key_columns):
-        if load_type == "incremental":
+        if load_type == "incremental" and not allow_incremental_without_target_unique_index:
             raise PreMigrationValidationError(
                 f"[{target_table}] Target business key {business_key_columns} is not backed by a non-partial unique index"
             )
+        if load_type == "incremental":
+            if source_business_key_has_duplicates(
+                target_conn, target_schema, target_table, business_key_columns
+            ):
+                raise PreMigrationValidationError(
+                    f"[{target_table}] Incremental load without a target unique index is enabled, "
+                    f"but target business key {business_key_columns} contains duplicate values"
+                )
+            logging.warning(
+                f"[{target_table}] Incremental load proceeding without a target unique index for "
+                f"business key {business_key_columns}. Current target data is unique, but concurrent "
+                "application writes can still create duplicates and merge performance may be reduced."
+            )
+            return
         logging.warning(
             f"[{target_table}] Full load proceeding without a target unique index for business key "
             f"{business_key_columns}; merge performance and concurrent-write protection may be reduced"
@@ -631,6 +646,10 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
         target_meta,
         business_key_columns,
         load_type,
+        table_cfg.get(
+            "allow_incremental_without_target_unique_index",
+            cfg["migration"].get("allow_incremental_without_target_unique_index", False),
+        ),
     )
     partition_column = table_cfg.get("partition_column")
     if partition_column and partition_column not in source_columns: raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} not found in source and target")

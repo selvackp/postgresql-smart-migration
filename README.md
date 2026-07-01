@@ -88,6 +88,7 @@ All keys below belong under `migration`.
 | `fail_on_error_log_failure` | `false` | Continue when writing `migration_error_log` fails. Set `true` to fail the table instead. |
 | `use_advisory_lock` | `true` | Prevent concurrent runs against the same target database. |
 | `advisory_lock_key` | `987654321` | Signed bigint lock identifier. Use a stable, application-specific value. |
+| `allow_incremental_without_target_unique_index` | `false` | Allow incremental merge without a target unique index after scanning current target data for duplicate business keys. This reduces safety against concurrent application writes and may be slower. A table can override this setting. |
 | `reset_sequences` | `true` | Synchronize sequence-backed target columns after successful full and incremental loads. The sequence is stored with `is_called=false`, so its next value is at least the table maximum plus its configured increment, without moving a live sequence backward. The table is briefly locked against concurrent writes while values are reconciled. |
 | `check_disabled_triggers_after_run` | `true` | Report target USER triggers that remain disabled at the end of the run. |
 | `tables` | Required | List of per-table migration definitions. |
@@ -104,6 +105,7 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Incremental requires a business/PK/unique key. Full load merges by key when one exists, or uses insert-only mode when no key exists. Full load does not truncate the target. |
 | `incremental_column` | Incremental only | Source/target column used for high-watermark ordering, such as `updated_at` or `crtdate`. NULL values are not selected. |
 | `business_key_columns` | Auto-detected | Stable, non-NULL data columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. Incremental loads require a matching non-partial target unique index; full loads only warn when it is absent. When the source lacks one, the script scans current source data for NULL and duplicate keys before loading. Required for incremental, optional for full load. |
+| `allow_incremental_without_target_unique_index` | Global setting | Optional per-table opt-in for legacy targets that cannot add a unique index. Current target keys are checked for duplicates before loading. |
 | `partition_column` | `null` | Target partition key. Use `null` for a non-partitioned target. The column must exist in source and target. |
 | `partition_type` | `null` | `range`, `list`, or `null`. Must match the target parent's PostgreSQL partition strategy. |
 | `range_partition_name_format` | Global setting | Optional per-table override for range partition names. |
@@ -113,6 +115,21 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `disable_triggers_during_load` | Global setting | Optional table override for trigger disable/enable behavior. |
 
 Business-key values in the source must contain no NULLs or duplicates. Incremental loads require the target key to have a matching non-partial unique index for replay-safe UPSERT behavior. Full loads may proceed without that target index and emit a warning, though merges can be slower. A source unique index is preferred for performance but is not mandatory; without one, pre-migration validation scans current source data. The first keyset page has no artificial lower-bound sentinel, so negative numbers, empty strings, and dates before 1900 are not skipped. For `load_type: full` tables without any key, the script uses insert-only mode with `OFFSET`-based batching; use it only for stable source tables, and preferably start from an empty target to avoid duplicates when no target unique constraint exists.
+
+For a legacy incremental target that cannot add a unique index, opt in explicitly:
+
+```yaml
+- source_table: prorptthreatpriority
+  target_table: prorptthreatpriority
+  load_type: incremental
+  incremental_column: crtdate
+  business_key_columns:
+    - id
+  allow_incremental_without_target_unique_index: true
+  enabled: true
+```
+
+The script verifies that current target `id` values are not duplicated before loading. Keep application writes controlled during migration because the database still cannot enforce uniqueness.
 
 ### Table examples
 

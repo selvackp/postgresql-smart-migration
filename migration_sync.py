@@ -8,6 +8,7 @@ import logging
 import ast
 import argparse
 import base64
+import hashlib
 from datetime import datetime, timedelta, date
 from decimal import Decimal
 from uuid import UUID
@@ -26,6 +27,10 @@ JSON_TYPES = ("json", "jsonb")
 
 
 class PreMigrationValidationError(Exception):
+    pass
+
+
+class ConflictRowsDetected(Exception):
     pass
 
 
@@ -168,6 +173,77 @@ def get_unique_key_columns(conn, schema_name, table_name):
         cur.execute(query, (schema_name, table_name, schema_name, table_name))
         return [r[0] for r in cur.fetchall()]
 
+
+def get_unique_indexes(conn, schema_name, table_name):
+    query = """
+        SELECT idx.relname, att.attname, key_col.ordinality
+        FROM pg_class tbl
+        JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+        JOIN pg_index ind ON ind.indrelid = tbl.oid
+        JOIN pg_class idx ON idx.oid = ind.indexrelid
+        JOIN LATERAL unnest(ind.indkey::smallint[]) WITH ORDINALITY
+          AS key_col(attnum, ordinality)
+          ON key_col.ordinality <= ind.indnkeyatts
+        JOIN pg_attribute att
+          ON att.attrelid = tbl.oid
+         AND att.attnum = key_col.attnum
+        WHERE ns.nspname = %s
+          AND tbl.relname = %s
+          AND ind.indisunique
+          AND ind.indisvalid
+          AND ind.indisready
+          AND ind.indpred IS NULL
+          AND ind.indexprs IS NULL
+        ORDER BY idx.relname, key_col.ordinality
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (schema_name, table_name))
+        rows = cur.fetchall()
+    indexes = {}
+    for index_name, column_name, _ in rows:
+        indexes.setdefault(index_name, []).append(column_name)
+    return list(indexes.values())
+
+
+def has_matching_unique_index(conn, schema_name, table_name, business_key_columns):
+    expected = set(business_key_columns)
+    return any(len(columns) == len(expected) and set(columns) == expected
+               for columns in get_unique_indexes(conn, schema_name, table_name))
+
+
+def validate_business_key_safety(
+    source_conn,
+    target_conn,
+    source_schema,
+    target_schema,
+    source_table,
+    target_table,
+    source_meta,
+    target_meta,
+    business_key_columns,
+):
+    if not business_key_columns:
+        return
+    if len(set(business_key_columns)) != len(business_key_columns):
+        raise PreMigrationValidationError(
+            f"[{target_table}] business_key_columns contains duplicate column names: {business_key_columns}"
+        )
+    nullable_source = [c for c in business_key_columns if source_meta[c]["is_nullable"] != "NO"]
+    nullable_target = [c for c in business_key_columns if target_meta[c]["is_nullable"] != "NO"]
+    if nullable_source or nullable_target:
+        raise PreMigrationValidationError(
+            f"[{target_table}] Business keys must be NOT NULL. "
+            f"Nullable source keys={nullable_source}, nullable target keys={nullable_target}"
+        )
+    if not has_matching_unique_index(source_conn, source_schema, source_table, business_key_columns):
+        raise PreMigrationValidationError(
+            f"[{target_table}] Source business key {business_key_columns} is not backed by a non-partial unique index"
+        )
+    if not has_matching_unique_index(target_conn, target_schema, target_table, business_key_columns):
+        raise PreMigrationValidationError(
+            f"[{target_table}] Target business key {business_key_columns} is not backed by a non-partial unique index"
+        )
+
 def normalize_type_name(meta):
     data_type = meta["data_type"]
     udt_name = meta.get("udt_name")
@@ -290,7 +366,9 @@ def convert_key_values(values, target_meta, business_key_columns):
         if value in (None, "", "None", "null", "NULL"):
             converted.append(None); continue
         data_type = target_meta[col]["data_type"]
-        if data_type in NUMERIC_TYPES: converted.append(int(value))
+        if data_type in ("bigint", "integer", "smallint"): converted.append(int(value))
+        elif data_type in ("numeric", "decimal"): converted.append(Decimal(str(value)))
+        elif data_type in ("real", "double precision"): converted.append(float(value))
         elif data_type == "date": converted.append(date.fromisoformat(str(value)[:10]))
         elif data_type in ("timestamp without time zone", "timestamp with time zone"): converted.append(datetime.fromisoformat(str(value)))
         else: converted.append(value)
@@ -321,12 +399,35 @@ def checkpoint_matches_business_key(table_checkpoint, business_key_columns):
     return True
 
 
+def serialize_key_values(values):
+    if values is None:
+        return None
+    return [str(value) for value in values]
+
+
 def create_error_table(target_conn, target_schema, error_table):
     query = sql.SQL("""
         CREATE TABLE IF NOT EXISTS {schema}.{error_table}
         (id bigserial PRIMARY KEY, table_name text, business_key text, error_message text, row_data jsonb, error_time timestamptz DEFAULT now())
     """).format(schema=sql.Identifier(target_schema), error_table=sql.Identifier(error_table))
     with target_conn.cursor() as cur: cur.execute(query)
+    target_conn.commit()
+
+
+def create_trigger_state_table(target_conn, target_schema):
+    query = sql.SQL("""
+        CREATE TABLE IF NOT EXISTS {schema}.migration_trigger_state (
+            advisory_lock_key bigint NOT NULL,
+            table_schema text NOT NULL,
+            table_name text NOT NULL,
+            trigger_name text NOT NULL,
+            previous_state "char" NOT NULL,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (advisory_lock_key, table_schema, table_name, trigger_name)
+        )
+    """).format(schema=sql.Identifier(target_schema))
+    with target_conn.cursor() as cur:
+        cur.execute(query)
     target_conn.commit()
 
 
@@ -460,6 +561,17 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
             raise PreMigrationValidationError(
                 f"[{target_table}] Business key {key_col} not found in source and target"
             )
+    validate_business_key_safety(
+        source_conn,
+        target_conn,
+        source_schema,
+        target_schema,
+        source_table,
+        target_table,
+        source_meta,
+        target_meta,
+        business_key_columns,
+    )
     partition_column = table_cfg.get("partition_column")
     if partition_column and partition_column not in source_columns: raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} not found in source and target")
     if partition_column and partition_column in generated_always_columns:
@@ -614,7 +726,8 @@ def create_range_partitions(target_conn, target_schema, target_table, min_value,
     end = next_partition_date(partition_start(max_value, granularity), granularity)
     while current < end:
         next_date = next_partition_date(current, granularity)
-        partition_name = f"{target_table}_{current.year}_{current.month:02d}_{current.day:02d}" if granularity == "daily" else f"{target_table}_{current.year}_{current.month:02d}"
+        suffix = f"{current.year}_{current.month:02d}_{current.day:02d}" if granularity == "daily" else f"{current.year}_{current.month:02d}"
+        partition_name = bounded_identifier(target_table, suffix)
         query = sql.SQL("CREATE TABLE IF NOT EXISTS {schema}.{partition} PARTITION OF {schema}.{parent} FOR VALUES FROM (%s) TO (%s)").format(
             schema=sql.Identifier(target_schema), partition=sql.Identifier(partition_name), parent=sql.Identifier(target_table))
         try:
@@ -631,9 +744,22 @@ def safe_partition_suffix(value):
     return str(value).replace("-", "_").replace(" ", "_").replace(":", "_").replace(".", "_")
 
 
+def bounded_identifier(prefix, suffix, max_bytes=63):
+    candidate = f"{prefix}_{suffix}"
+    if len(candidate.encode("utf-8")) <= max_bytes:
+        return candidate
+    digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:12]
+    available = max_bytes - len(digest) - 1
+    shortened = prefix
+    while shortened and len(shortened.encode("utf-8")) > available:
+        shortened = shortened[:-1]
+    return f"{shortened}_{digest}"
+
+
 def create_list_partitions(target_conn, target_schema, target_table, partition_column, values):
     for value in values:
-        partition_name = f"{target_table}_{partition_column}_{safe_partition_suffix(value)}"
+        suffix = f"{partition_column}_{safe_partition_suffix(value)}"
+        partition_name = bounded_identifier(target_table, suffix)
         query = sql.SQL("CREATE TABLE IF NOT EXISTS {schema}.{partition} PARTITION OF {schema}.{parent} FOR VALUES IN (%s)").format(
             schema=sql.Identifier(target_schema), partition=sql.Identifier(partition_name), parent=sql.Identifier(target_table))
         try:
@@ -662,6 +788,43 @@ def ensure_partitions(source_conn, target_conn, cfg, table_cfg):
         raise Exception(f"[{target_table}] Invalid partition_type: {partition_type}")
 
 
+def ensure_partitions_for_rows(target_conn, cfg, table_cfg, source_columns, rows):
+    if not cfg["migration"].get("create_missing_partitions", True):
+        return
+    partition_column = table_cfg.get("partition_column")
+    if not partition_column or not rows:
+        return
+    target_schema = cfg["target"]["schema"]
+    target_table = table_cfg["target_table"]
+    partition_type = table_cfg.get("partition_type")
+    column_index = source_columns.index(partition_column)
+    values = [row[column_index] for row in rows if row[column_index] is not None]
+    if not values:
+        return
+    if partition_type == "range":
+        granularity = cfg["migration"].get("partition_granularity", "monthly")
+        required_starts = sorted({partition_start(value, granularity) for value in values})
+        for required_start in required_starts:
+            create_range_partitions(
+                target_conn,
+                target_schema,
+                target_table,
+                required_start,
+                required_start,
+                granularity,
+            )
+    elif partition_type == "list":
+        create_list_partitions(
+            target_conn,
+            target_schema,
+            target_table,
+            partition_column,
+            list(dict.fromkeys(values)),
+        )
+    else:
+        raise Exception(f"[{target_table}] Invalid partition_type: {partition_type}")
+
+
 def create_temp_table(target_conn, target_schema, target_table, temp_table, columns):
     col_sql = sql.SQL(", ").join(sql.Identifier(c) for c in columns)
     query = sql.SQL("DROP TABLE IF EXISTS {temp_table}; CREATE TEMP TABLE {temp_table} AS SELECT {cols} FROM {schema}.{table} WHERE 1 = 2").format(
@@ -676,13 +839,27 @@ def fetch_incremental_batch(source_conn, source_schema, source_table, columns, i
     order_sql = sql.SQL(", ").join(sql.Identifier(c) for c in order_columns)
     key_cols_sql = sql.SQL(", ").join(sql.Identifier(c) for c in business_key_columns)
     key_placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in business_key_columns)
-    query = sql.SQL("""
-        SELECT {select_cols} FROM {schema}.{table}
-        WHERE {inc} IS NOT NULL AND {inc} <= %s
-          AND ({inc} > %s OR ({inc} = %s AND ({key_cols}) > ({key_values})))
-        ORDER BY {order_cols} LIMIT %s
-    """).format(select_cols=select_cols, schema=sql.Identifier(source_schema), table=sql.Identifier(source_table), inc=sql.Identifier(incremental_column), key_cols=key_cols_sql, key_values=key_placeholders, order_cols=order_sql)
-    params = [high_watermark, last_incremental_value, last_incremental_value] + list(last_key_values) + [batch_size]
+    if last_incremental_value is None:
+        query = sql.SQL("""
+            SELECT {select_cols} FROM {schema}.{table}
+            WHERE {inc} IS NOT NULL AND {inc} <= %s
+            ORDER BY {order_cols} LIMIT %s
+        """).format(
+            select_cols=select_cols,
+            schema=sql.Identifier(source_schema),
+            table=sql.Identifier(source_table),
+            inc=sql.Identifier(incremental_column),
+            order_cols=order_sql,
+        )
+        params = [high_watermark, batch_size]
+    else:
+        query = sql.SQL("""
+            SELECT {select_cols} FROM {schema}.{table}
+            WHERE {inc} IS NOT NULL AND {inc} <= %s
+              AND ({inc} > %s OR ({inc} = %s AND ({key_cols}) > ({key_values})))
+            ORDER BY {order_cols} LIMIT %s
+        """).format(select_cols=select_cols, schema=sql.Identifier(source_schema), table=sql.Identifier(source_table), inc=sql.Identifier(incremental_column), key_cols=key_cols_sql, key_values=key_placeholders, order_cols=order_sql)
+        params = [high_watermark, last_incremental_value, last_incremental_value] + list(last_key_values) + [batch_size]
     with source_conn.cursor() as cur:
         cur.execute(query, params)
         return cur.fetchall()
@@ -693,9 +870,18 @@ def fetch_full_batch(source_conn, source_schema, source_table, columns, business
     order_sql = sql.SQL(", ").join(sql.Identifier(c) for c in business_key_columns)
     key_cols_sql = sql.SQL(", ").join(sql.Identifier(c) for c in business_key_columns)
     key_placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in business_key_columns)
-    query = sql.SQL("SELECT {select_cols} FROM {schema}.{table} WHERE ({key_cols}) > ({key_values}) ORDER BY {order_cols} LIMIT %s").format(
-        select_cols=select_cols, schema=sql.Identifier(source_schema), table=sql.Identifier(source_table), key_cols=key_cols_sql, key_values=key_placeholders, order_cols=order_sql)
-    params = list(last_key_values) + [batch_size]
+    if last_key_values is None:
+        query = sql.SQL("SELECT {select_cols} FROM {schema}.{table} ORDER BY {order_cols} LIMIT %s").format(
+            select_cols=select_cols,
+            schema=sql.Identifier(source_schema),
+            table=sql.Identifier(source_table),
+            order_cols=order_sql,
+        )
+        params = [batch_size]
+    else:
+        query = sql.SQL("SELECT {select_cols} FROM {schema}.{table} WHERE ({key_cols}) > ({key_values}) ORDER BY {order_cols} LIMIT %s").format(
+            select_cols=select_cols, schema=sql.Identifier(source_schema), table=sql.Identifier(source_table), key_cols=key_cols_sql, key_values=key_placeholders, order_cols=order_sql)
+        params = list(last_key_values) + [batch_size]
     with source_conn.cursor() as cur:
         cur.execute(query, params)
         return cur.fetchall()
@@ -725,9 +911,107 @@ def fetch_full_insert_only_batch(source_conn, source_schema, source_table, colum
         cur.execute(query, (offset_rows, batch_size))
         return cur.fetchall()
 
+
+def get_table_row_count(conn, schema_name, table_name):
+    query = sql.SQL("SELECT COUNT(*) FROM {schema}.{table}").format(
+        schema=sql.Identifier(schema_name),
+        table=sql.Identifier(table_name),
+    )
+    with conn.cursor() as cur:
+        cur.execute(query)
+        return int(cur.fetchone()[0])
+
+
+def count_source_rows_for_run(
+    source_conn,
+    source_schema,
+    source_table,
+    load_type,
+    incremental_column,
+    business_key_columns,
+    last_incremental_value,
+    last_key_values,
+    high_watermark,
+    offset_rows,
+):
+    if load_type == "full" and not business_key_columns:
+        return max(get_table_row_count(source_conn, source_schema, source_table) - offset_rows, 0)
+    if load_type == "full":
+        if last_key_values is None:
+            return get_table_row_count(source_conn, source_schema, source_table)
+        key_cols = sql.SQL(", ").join(sql.Identifier(c) for c in business_key_columns)
+        placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in business_key_columns)
+        query = sql.SQL("SELECT COUNT(*) FROM {schema}.{table} WHERE ({keys}) > ({values})").format(
+            schema=sql.Identifier(source_schema),
+            table=sql.Identifier(source_table),
+            keys=key_cols,
+            values=placeholders,
+        )
+        params = list(last_key_values)
+    elif last_incremental_value is None:
+        query = sql.SQL("""
+            SELECT COUNT(*) FROM {schema}.{table}
+            WHERE {incremental} IS NOT NULL AND {incremental} <= %s
+        """).format(
+            schema=sql.Identifier(source_schema),
+            table=sql.Identifier(source_table),
+            incremental=sql.Identifier(incremental_column),
+        )
+        params = [high_watermark]
+    else:
+        key_cols = sql.SQL(", ").join(sql.Identifier(c) for c in business_key_columns)
+        placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in business_key_columns)
+        query = sql.SQL("""
+            SELECT COUNT(*) FROM {schema}.{table}
+            WHERE {incremental} IS NOT NULL AND {incremental} <= %s
+              AND ({incremental} > %s OR ({incremental} = %s AND ({keys}) > ({values})))
+        """).format(
+            schema=sql.Identifier(source_schema),
+            table=sql.Identifier(source_table),
+            incremental=sql.Identifier(incremental_column),
+            keys=key_cols,
+            values=placeholders,
+        )
+        params = [high_watermark, last_incremental_value, last_incremental_value] + list(last_key_values)
+    with source_conn.cursor() as cur:
+        cur.execute(query, params)
+        return int(cur.fetchone()[0])
+
+
+def new_reconciliation_stats(target_table, load_type):
+    return {
+        "table": target_table,
+        "load_type": load_type,
+        "source_rows": 0,
+        "source_total": 0,
+        "processed": 0,
+        "inserted": 0,
+        "updated": 0,
+        "rejected": 0,
+        "conflict_skipped": 0,
+        "target_total": 0,
+        "target_difference": 0,
+        "status": "SUCCESS",
+    }
+
+
+def finalize_reconciliation_stats(stats, source_conn, target_conn, cfg, table_cfg):
+    stats["source_total"] = get_table_row_count(
+        source_conn, cfg["source"]["schema"], table_cfg["source_table"]
+    )
+    stats["target_total"] = get_table_row_count(
+        target_conn, cfg["target"]["schema"], table_cfg["target_table"]
+    )
+    stats["target_difference"] = stats["target_total"] - stats["source_total"]
+    accounted = (
+        stats["inserted"] + stats["updated"] + stats["rejected"] + stats["conflict_skipped"]
+    )
+    stats["unaccounted"] = stats["processed"] - accounted
+    stats["window_difference"] = stats["source_rows"] - stats["processed"]
+    return stats
+
 def truncate_temp(target_conn, temp_table):
     with target_conn.cursor() as cur: cur.execute(sql.SQL("TRUNCATE TABLE {temp_table}").format(temp_table=sql.Identifier(temp_table)))
-    target_conn.commit()
 
 
 def copy_to_temp(target_conn, temp_table, columns, rows):
@@ -769,9 +1053,13 @@ def merge_from_temp_business_key(target_conn, target_schema, target_table, temp_
         join_condition=join_condition
     )
     with target_conn.cursor() as cur:
-        if update_sql is not None: cur.execute(update_sql)
+        updated_rows = 0
+        if update_sql is not None:
+            cur.execute(update_sql)
+            updated_rows = cur.rowcount
         cur.execute(insert_sql)
-    target_conn.commit()
+        inserted_rows = cur.rowcount
+    return updated_rows, inserted_rows
 
 
 
@@ -797,8 +1085,113 @@ def insert_from_temp_only(target_conn, target_schema, target_table, temp_table, 
 
     with target_conn.cursor() as cur:
         cur.execute(insert_sql)
+        inserted_rows = cur.rowcount
+    return 0, inserted_rows
 
-    target_conn.commit()
+
+def is_row_level_database_error(error):
+    sqlstate = getattr(error, "pgcode", None)
+    return bool(sqlstate and sqlstate[:2] in ("22", "23"))
+
+
+def row_error_record(row, columns, business_key_columns, error_message):
+    row_dict = dict(zip(columns, row))
+    business_key = "|".join(str(row_dict.get(column)) for column in business_key_columns)
+    return {
+        "business_key": business_key,
+        "error_message": error_message,
+        "row_data": row_dict,
+    }
+
+
+def load_rows_with_isolation(
+    target_conn,
+    target_schema,
+    target_table,
+    temp_table,
+    columns,
+    business_key_columns,
+    incremental_column,
+    load_type,
+    rows,
+    depth=0,
+):
+    if not rows:
+        return {"inserted": 0, "updated": 0, "conflict_skipped": 0}, [], []
+
+    savepoint = sql.Identifier(f"migration_chunk_{depth}")
+    with target_conn.cursor() as cur:
+        cur.execute(sql.SQL("SAVEPOINT {}").format(savepoint))
+    try:
+        truncate_temp(target_conn, temp_table)
+        copy_to_temp(target_conn, temp_table, columns, rows)
+        if load_type == "full" and not business_key_columns:
+            updated_rows, inserted_rows = insert_from_temp_only(
+                target_conn, target_schema, target_table, temp_table, columns
+            )
+        else:
+            updated_rows, inserted_rows = merge_from_temp_business_key(
+                target_conn,
+                target_schema,
+                target_table,
+                temp_table,
+                columns,
+                business_key_columns,
+                incremental_column,
+                load_type,
+            )
+        conflict_rows = len(rows) - updated_rows - inserted_rows
+        if conflict_rows < 0:
+            raise RuntimeError(
+                f"[{target_table}] Database affected more rows than supplied; verify business-key uniqueness"
+            )
+        if conflict_rows and len(rows) > 1:
+            raise ConflictRowsDetected()
+        with target_conn.cursor() as cur:
+            cur.execute(sql.SQL("RELEASE SAVEPOINT {}").format(savepoint))
+        conflicts = []
+        if conflict_rows:
+            conflicts.append(row_error_record(
+                rows[0],
+                columns,
+                business_key_columns,
+                "Row skipped by ON CONFLICT DO NOTHING",
+            ))
+        return {
+            "inserted": inserted_rows,
+            "updated": updated_rows,
+            "conflict_skipped": conflict_rows,
+        }, [], conflicts
+    except Exception as error:
+        with target_conn.cursor() as cur:
+            cur.execute(sql.SQL("ROLLBACK TO SAVEPOINT {}").format(savepoint))
+            cur.execute(sql.SQL("RELEASE SAVEPOINT {}").format(savepoint))
+        if isinstance(error, ConflictRowsDetected) or is_row_level_database_error(error):
+            if len(rows) == 1:
+                if isinstance(error, ConflictRowsDetected):
+                    raise RuntimeError("Conflict isolation reached an unexpected leaf state")
+                bad_row = row_error_record(
+                    rows[0],
+                    columns,
+                    business_key_columns,
+                    f"PostgreSQL rejected row: {error}",
+                )
+                return {"inserted": 0, "updated": 0, "conflict_skipped": 0}, [bad_row], []
+            midpoint = len(rows) // 2
+            left = load_rows_with_isolation(
+                target_conn, target_schema, target_table, temp_table, columns,
+                business_key_columns, incremental_column, load_type, rows[:midpoint], depth + 1
+            )
+            right = load_rows_with_isolation(
+                target_conn, target_schema, target_table, temp_table, columns,
+                business_key_columns, incremental_column, load_type, rows[midpoint:], depth + 1
+            )
+            stats = {
+                key: left[0][key] + right[0][key]
+                for key in ("inserted", "updated", "conflict_skipped")
+            }
+            return stats, left[1] + right[1], left[2] + right[2]
+        raise
 
 def set_table_triggers(target_conn, schema_name, table_name, action):
     if action not in ("DISABLE", "ENABLE"): raise Exception("Trigger action must be DISABLE or ENABLE")
@@ -807,18 +1200,113 @@ def set_table_triggers(target_conn, schema_name, table_name, action):
     target_conn.commit()
 
 
+def get_user_trigger_states(target_conn, schema_name, table_name):
+    query = """
+        SELECT t.tgname, t.tgenabled
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = %s
+          AND c.relname = %s
+          AND NOT t.tgisinternal
+        ORDER BY t.tgname
+    """
+    with target_conn.cursor() as cur:
+        cur.execute(query, (schema_name, table_name))
+        return cur.fetchall()
+
+
+def record_and_disable_table_triggers(target_conn, state_schema, table_schema, table_name, lock_key):
+    trigger_states = get_user_trigger_states(target_conn, table_schema, table_name)
+    if not trigger_states:
+        return False
+    insert_query = sql.SQL("""
+        INSERT INTO {state_schema}.migration_trigger_state
+            (advisory_lock_key, table_schema, table_name, trigger_name, previous_state)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (advisory_lock_key, table_schema, table_name, trigger_name)
+        DO UPDATE SET previous_state = EXCLUDED.previous_state, recorded_at = now()
+    """).format(state_schema=sql.Identifier(state_schema))
+    with target_conn.cursor() as cur:
+        for trigger_name, previous_state in trigger_states:
+            cur.execute(insert_query, (lock_key, table_schema, table_name, trigger_name, previous_state))
+    target_conn.commit()
+    set_table_triggers(target_conn, table_schema, table_name, "DISABLE")
+    return True
+
+
+def restore_recorded_table_triggers(target_conn, state_schema, table_schema, table_name, lock_key):
+    select_query = sql.SQL("""
+        SELECT trigger_name, previous_state
+        FROM {state_schema}.migration_trigger_state
+        WHERE advisory_lock_key = %s AND table_schema = %s AND table_name = %s
+        ORDER BY trigger_name
+    """).format(state_schema=sql.Identifier(state_schema))
+    with target_conn.cursor() as cur:
+        cur.execute(select_query, (lock_key, table_schema, table_name))
+        trigger_states = cur.fetchall()
+        for trigger_name, previous_state in trigger_states:
+            if previous_state == "D":
+                action = sql.SQL("DISABLE TRIGGER")
+            elif previous_state == "R":
+                action = sql.SQL("ENABLE REPLICA TRIGGER")
+            elif previous_state == "A":
+                action = sql.SQL("ENABLE ALWAYS TRIGGER")
+            else:
+                action = sql.SQL("ENABLE TRIGGER")
+            cur.execute(
+                sql.SQL("ALTER TABLE {schema}.{table} {action} {trigger}").format(
+                    schema=sql.Identifier(table_schema),
+                    table=sql.Identifier(table_name),
+                    action=action,
+                    trigger=sql.Identifier(trigger_name),
+                )
+            )
+        cur.execute(
+            sql.SQL("""
+                DELETE FROM {state_schema}.migration_trigger_state
+                WHERE advisory_lock_key = %s AND table_schema = %s AND table_name = %s
+            """).format(state_schema=sql.Identifier(state_schema)),
+            (lock_key, table_schema, table_name),
+        )
+    target_conn.commit()
+    return len(trigger_states)
+
+
+def recover_recorded_triggers(target_conn, state_schema, lock_key):
+    query = sql.SQL("""
+        SELECT DISTINCT table_schema, table_name
+        FROM {state_schema}.migration_trigger_state
+        WHERE advisory_lock_key = %s
+        ORDER BY table_schema, table_name
+    """).format(state_schema=sql.Identifier(state_schema))
+    with target_conn.cursor() as cur:
+        cur.execute(query, (lock_key,))
+        tables = cur.fetchall()
+    for table_schema, table_name in tables:
+        restored = restore_recorded_table_triggers(
+            target_conn, state_schema, table_schema, table_name, lock_key
+        )
+        logging.warning(
+            f"[{table_name}] Recovered {restored} trigger state(s) left by an interrupted migration"
+        )
+
+
 def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
     source_schema, target_schema, m = cfg["source"]["schema"], cfg["target"]["schema"], cfg["migration"]
     source_table, target_table, incremental_column = table_cfg["source_table"], table_cfg["target_table"], table_cfg.get("incremental_column")
     load_type = get_load_type(cfg, table_cfg)
     if load_type == "skip": logging.info(f"[{target_table}] Skipped"); return
     if load_type not in ("full", "incremental"): raise Exception(f"[{target_table}] Invalid load_type: {load_type}")
+    stats = new_reconciliation_stats(target_table, load_type)
     table_key, temp_table = f"{source_schema}.{source_table}_to_{target_schema}.{target_table}", f"tmp_migration_{target_table}"
     source_columns, target_columns, source_meta, target_meta, business_key_columns = prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type)
-    ensure_partitions(source_conn, target_conn, cfg, table_cfg)
     if load_type == "incremental":
         min_value, max_value = get_min_max_column(source_conn, source_schema, source_table, incremental_column)
-        if min_value is None or max_value is None: logging.info(f"[{target_table}] No data found"); return
+        if min_value is None or max_value is None:
+            logging.info(f"[{target_table}] No data found")
+            stats["status"] = "NO_DATA"
+            return finalize_reconciliation_stats(stats, source_conn, target_conn, cfg, table_cfg)
     else:
         min_value = max_value = None
     table_checkpoint = checkpoint_data.get(table_key)
@@ -828,7 +1316,8 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
 
         if load_type == "full" and status == "COMPLETED":
             logging.info(f"[{target_table}] Full load already completed. Skipping.")
-            return
+            stats["status"] = "ALREADY_COMPLETED"
+            return finalize_reconciliation_stats(stats, source_conn, target_conn, cfg, table_cfg)
 
         last_key_values = convert_key_values(
             table_checkpoint["last_key_values"],
@@ -856,18 +1345,31 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                 f"or last_key_values count mismatch. Old checkpoint will be replaced."
             )
 
-        last_key_values = get_initial_key_values(target_meta, business_key_columns) if business_key_columns else []
+        last_key_values = None if business_key_columns else []
         total_rows = 0
 
         if load_type == "incremental":
-            last_incremental_value = get_initial_incremental_value(min_value)
+            last_incremental_value = None
             high_watermark = max_value
         else:
             last_incremental_value = None
             high_watermark = None
 
         logging.info(f"[{target_table}] Start load_type={load_type}, last_incremental={last_incremental_value}, high_watermark={high_watermark}")
+    stats["source_rows"] = count_source_rows_for_run(
+        source_conn,
+        source_schema,
+        source_table,
+        load_type,
+        incremental_column,
+        business_key_columns,
+        last_incremental_value,
+        last_key_values,
+        high_watermark,
+        total_rows,
+    )
     triggers_disabled = False
+    lock_key = int(m.get("advisory_lock_key", 987654321))
     try:
         disable_triggers = table_cfg.get(
             "disable_triggers_during_load",
@@ -875,9 +1377,11 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
         )
 
         if disable_triggers:
-            set_table_triggers(target_conn, target_schema, target_table, "DISABLE")
-            triggers_disabled = True
-            logging.info(f"[{target_table}] User triggers disabled")
+            triggers_disabled = record_and_disable_table_triggers(
+                target_conn, target_schema, target_schema, target_table, lock_key
+            )
+            if triggers_disabled:
+                logging.info(f"[{target_table}] User triggers disabled and recovery state recorded")
         create_temp_table(target_conn, target_schema, target_table, temp_table, target_columns)
         while True:
             retry_count = 0
@@ -917,11 +1421,40 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         )
                     if not rows:
                         final_status = "WAITING_FOR_NEXT_RUN" if load_type == "incremental" else "COMPLETED"
-                        checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value), "last_key_values": [str(v) for v in last_key_values], "high_watermark": str(high_watermark), "total_rows": total_rows, "status": final_status, "load_type": load_type, "business_key_columns": business_key_columns}
-                        write_checkpoint(m["checkpoint_file"], checkpoint_data); logging.info(f"[{target_table}] No rows found. Status={final_status}"); return
+                        checkpoint_data[table_key] = {
+                            "last_incremental_value": str(last_incremental_value) if last_incremental_value is not None else None,
+                            "last_key_values": serialize_key_values(last_key_values),
+                            "high_watermark": str(high_watermark) if high_watermark is not None else None,
+                            "total_rows": total_rows,
+                            "status": final_status,
+                            "load_type": load_type,
+                            "business_key_columns": business_key_columns,
+                        }
+                        write_checkpoint(m["checkpoint_file"], checkpoint_data)
+                        stats["status"] = final_status
+                        logging.info(f"[{target_table}] No rows found. Status={final_status}")
+                        return finalize_reconciliation_stats(stats, source_conn, target_conn, cfg, table_cfg)
+                    ensure_partitions_for_rows(target_conn, cfg, table_cfg, source_columns, rows)
                     good_rows, bad_rows = validate_rows(rows, source_columns, target_columns, target_meta, business_key_columns, cfg, table_cfg)
-                    if bad_rows:
-                        for bad_row in bad_rows:
+                    batch_stats = {"inserted": 0, "updated": 0, "conflict_skipped": 0}
+                    database_bad_rows = []
+                    conflict_rows = []
+                    if good_rows:
+                        batch_stats, database_bad_rows, conflict_rows = load_rows_with_isolation(
+                            target_conn,
+                            target_schema,
+                            target_table,
+                            temp_table,
+                            target_columns,
+                            business_key_columns,
+                            incremental_column,
+                            load_type,
+                            good_rows,
+                        )
+                        target_conn.commit()
+                    rows_to_log = bad_rows + database_bad_rows + conflict_rows
+                    if rows_to_log:
+                        for bad_row in rows_to_log:
                             logging.error(
                                 f"[{target_table}] Bad row: key={bad_row['business_key']}, "
                                 f"error={bad_row['error_message']}"
@@ -931,55 +1464,61 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                             target_schema,
                             m["error_table"],
                             target_table,
-                            bad_rows,
+                            rows_to_log,
                             fail_on_error=m.get("fail_on_error_log_failure", False),
                         )
-                        logging.warning(f"[{target_table}] Bad rows skipped: {len(bad_rows)}")
-                    if good_rows:
-                        truncate_temp(target_conn, temp_table); copy_to_temp(target_conn, temp_table, target_columns, good_rows)
-                        if load_type == "full" and not business_key_columns:
-                            insert_from_temp_only(
-                                target_conn,
-                                target_schema,
-                                target_table,
-                                temp_table,
-                                target_columns
-                            )
-                        else:
-                            merge_from_temp_business_key(
-                                target_conn,
-                                target_schema,
-                                target_table,
-                                temp_table,
-                                target_columns,
-                                business_key_columns,
-                                incremental_column,
-                                load_type
-                            )
+                        logging.warning(f"[{target_table}] Rows logged: {len(rows_to_log)}")
+
+                    last_row = rows[-1]
+                    last_row_dict = dict(zip(source_columns, last_row))
+                    next_key_values = [last_row_dict[c] for c in business_key_columns] if business_key_columns else []
+                    next_incremental_value = (
+                        last_row_dict[incremental_column]
+                        if load_type == "incremental"
+                        else last_incremental_value
+                    )
+                    next_total_rows = total_rows + len(rows)
+                    checkpoint_data[table_key] = {
+                        "last_incremental_value": str(next_incremental_value) if next_incremental_value is not None else None,
+                        "last_key_values": serialize_key_values(next_key_values),
+                        "high_watermark": str(high_watermark) if high_watermark is not None else None,
+                        "total_rows": next_total_rows,
+                        "status": "RUNNING",
+                        "load_type": load_type,
+                        "business_key_columns": business_key_columns,
+                    }
+                    write_checkpoint(m["checkpoint_file"], checkpoint_data)
+                    last_key_values = next_key_values
+                    last_incremental_value = next_incremental_value
+                    total_rows = next_total_rows
+                    stats["processed"] += len(rows)
+                    stats["inserted"] += batch_stats["inserted"]
+                    stats["updated"] += batch_stats["updated"]
+                    stats["rejected"] += len(bad_rows) + len(database_bad_rows)
+                    stats["conflict_skipped"] += batch_stats["conflict_skipped"]
+                    logging.info(
+                        f"[{target_table}] Batch={len(rows)}, Inserted={batch_stats['inserted']}, "
+                        f"Updated={batch_stats['updated']}, Rejected={len(bad_rows) + len(database_bad_rows)}, "
+                        f"ConflictSkipped={batch_stats['conflict_skipped']}, Total={total_rows}"
+                    )
                     break
                 except Exception as e:
                     target_conn.rollback(); retry_count += 1
                     logging.exception(f"[{target_table}] Retry {retry_count}/{m['max_retries']} failed: {e}")
                     time.sleep(10)
                     if retry_count == m["max_retries"]:
-                        checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value), "last_key_values": [str(v) for v in last_key_values], "high_watermark": str(high_watermark), "total_rows": total_rows, "status": "FAILED", "load_type": load_type, "business_key_columns": business_key_columns, "error": str(e)}
+                        checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value) if last_incremental_value is not None else None, "last_key_values": serialize_key_values(last_key_values), "high_watermark": str(high_watermark) if high_watermark is not None else None, "total_rows": total_rows, "status": "FAILED", "load_type": load_type, "business_key_columns": business_key_columns, "error": str(e)}
                         write_checkpoint(m["checkpoint_file"], checkpoint_data); raise e
-            last_row = rows[-1]
-            last_row_dict = dict(zip(source_columns, last_row))
-            last_key_values = [last_row_dict[c] for c in business_key_columns] if business_key_columns else []
-            if load_type == "incremental":
-                last_incremental_value = last_row_dict[incremental_column]
-            total_rows += len(rows)
-            checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value), "last_key_values": [str(v) for v in last_key_values], "high_watermark": str(high_watermark), "total_rows": total_rows, "status": "RUNNING", "load_type": load_type, "business_key_columns": business_key_columns}
-            write_checkpoint(m["checkpoint_file"], checkpoint_data)
-            logging.info(f"[{target_table}] Batch={len(rows)}, Good={len(good_rows)}, Bad={len(bad_rows)}, Total={total_rows}")
             time.sleep(m["sleep_seconds"])
     finally:
         if triggers_disabled:
             try:
-                set_table_triggers(target_conn, target_schema, target_table, "ENABLE"); logging.info(f"[{target_table}] User triggers enabled")
+                restored = restore_recorded_table_triggers(
+                    target_conn, target_schema, target_schema, target_table, lock_key
+                )
+                logging.info(f"[{target_table}] Restored {restored} user trigger state(s)")
             except Exception as e:
-                logging.error(f"[{target_table}] Failed to enable triggers: {e}"); raise e
+                logging.error(f"[{target_table}] Failed to restore triggers: {e}"); raise e
 
 
 
@@ -1060,25 +1599,64 @@ def reset_table_sequences(conn, schema_name, table_name):
         cur.execute(query, (schema_name, table_name))
         rows = cur.fetchall()
 
+    if not rows:
+        logging.info(f"[{table_name}] No sequence-backed columns found")
+        return 0
+
+    lock_query = sql.SQL("LOCK TABLE {schema}.{table} IN SHARE ROW EXCLUSIVE MODE").format(
+        schema=sql.Identifier(schema_name),
+        table=sql.Identifier(table_name),
+    )
+    with conn.cursor() as cur:
+        cur.execute(lock_query)
+
     for column_name, seq_name in rows:
-        stmt = sql.SQL("""
-            SELECT setval(
-                %s::regclass,
-                COALESCE((SELECT MAX({col}) FROM {schema}.{table}), 0) + 1,
-                false
-            )
-        """).format(
+        metadata_query = """
+            SELECT sequence_metadata.seqstart,
+                   sequence_metadata.seqincrement,
+                   sequence_view.last_value
+            FROM pg_sequence sequence_metadata
+            JOIN pg_class sequence_class ON sequence_class.oid = sequence_metadata.seqrelid
+            JOIN pg_namespace sequence_schema ON sequence_schema.oid = sequence_class.relnamespace
+            LEFT JOIN pg_sequences sequence_view
+              ON sequence_view.schemaname = sequence_schema.nspname
+             AND sequence_view.sequencename = sequence_class.relname
+            WHERE sequence_metadata.seqrelid = %s::regclass
+        """
+        with conn.cursor() as cur:
+            cur.execute(metadata_query, (seq_name,))
+            seq_start, seq_increment, current_value = cur.fetchone()
+
+        aggregate = sql.SQL("MAX") if seq_increment > 0 else sql.SQL("MIN")
+        value_query = sql.SQL("SELECT {aggregate}({col}) FROM {schema}.{table}").format(
+            aggregate=aggregate,
             col=sql.Identifier(column_name),
             schema=sql.Identifier(schema_name),
-            table=sql.Identifier(table_name)
+            table=sql.Identifier(table_name),
         )
+        with conn.cursor() as cur:
+            cur.execute(value_query)
+            table_value = cur.fetchone()[0]
+
+        if table_value is None:
+            logging.info(f"[{table_name}] Sequence {seq_name} unchanged because the table is empty")
+            continue
+        if current_value is None:
+            desired_value = table_value
+        elif seq_increment > 0:
+            desired_value = max(current_value, table_value)
+        else:
+            desired_value = min(current_value, table_value)
 
         with conn.cursor() as cur:
-            cur.execute(stmt, (seq_name,))
+            cur.execute("SELECT setval(%s::regclass, %s, true)", (seq_name, desired_value))
 
-        logging.info(f"[{table_name}] Sequence reset for column {column_name}: {seq_name}")
+        logging.info(
+            f"[{table_name}] Sequence synchronized for {column_name}: {seq_name} -> {desired_value}"
+        )
 
     conn.commit()
+    return len(rows)
 
 
 def should_reset_sequences(cfg):
@@ -1106,6 +1684,7 @@ def main():
     success_tables = []
     failed_tables = []
     skipped_tables = []
+    reconciliation_results = []
     bad_row_count = 0
     disabled_trigger_count = 0
 
@@ -1125,7 +1704,7 @@ def main():
             cur.execute("SET TIME ZONE %s", (timezone,))
             cur.execute("SET lock_timeout = '5s'")
             cur.execute("SET statement_timeout = '0'")
-            cur.execute("SET synchronous_commit = off")
+            cur.execute("SET synchronous_commit = on")
 
         target_conn.commit()
 
@@ -1144,6 +1723,13 @@ def main():
             target_conn,
             cfg["target"]["schema"],
             cfg["migration"]["error_table"]
+        )
+        create_trigger_state_table(target_conn, cfg["target"]["schema"])
+        recover_recorded_triggers(target_conn, cfg["target"]["schema"], lock_key)
+        bad_row_start = get_bad_row_count(
+            target_conn,
+            cfg["target"]["schema"],
+            cfg["migration"]["error_table"],
         )
 
         checkpoint_data = read_checkpoint(cfg["migration"]["checkpoint_file"])
@@ -1164,21 +1750,24 @@ def main():
                 logging.info("=" * 100)
                 logging.info(f"[{table_name}] Table migration started")
 
-                migrate_table(
+                reconciliation = migrate_table(
                     source_conn,
                     target_conn,
                     cfg,
                     table_cfg,
                     checkpoint_data
                 )
+                if reconciliation:
+                    reconciliation_results.append(reconciliation)
 
                 # Reset sequence-backed columns after successful full or incremental load.
                 if should_reset_sequences(cfg):
-                    reset_table_sequences(
+                    sequence_count = reset_table_sequences(
                         target_conn,
                         cfg["target"]["schema"],
                         table_name
                     )
+                    logging.info(f"[{table_name}] Sequence reset check completed; detected={sequence_count}")
 
                 success_tables.append(table_name)
                 logging.info(f"[{table_name}] Table migration completed")
@@ -1213,7 +1802,7 @@ def main():
             target_conn,
             cfg["target"]["schema"],
             cfg["migration"]["error_table"]
-        )
+        ) - bad_row_start
 
         if cfg["migration"].get("check_disabled_triggers_after_run", True):
             disabled_trigger_count = check_disabled_triggers(target_conn, cfg["target"]["schema"])
@@ -1231,6 +1820,19 @@ def main():
 
         for item in skipped_tables:
             logging.warning(f"SKIPPED TABLE: {item['table']} | REASON: {item['reason']}")
+
+        logging.info("PER-TABLE RECONCILIATION")
+        for item in reconciliation_results:
+            log_method = logging.error if item["unaccounted"] or item["window_difference"] else logging.info
+            log_method(
+                f"RECONCILIATION: {item['table']} | SourceWindow={item['source_rows']} | "
+                f"Processed={item['processed']} | Inserted={item['inserted']} | "
+                f"Updated={item['updated']} | Rejected={item['rejected']} | "
+                f"ConflictSkipped={item['conflict_skipped']} | Unaccounted={item['unaccounted']} | "
+                f"WindowDifference={item['window_difference']} | "
+                f"SourceTotal={item['source_total']} | TargetTotal={item['target_total']} | "
+                f"TargetDifference={item['target_difference']} | Status={item['status']}"
+            )
 
         logging.info("Migration sync completed")
 

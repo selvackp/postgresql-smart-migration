@@ -720,14 +720,41 @@ def next_partition_date(d, granularity):
     raise Exception("partition_granularity must be daily or monthly")
 
 
-def create_range_partitions(target_conn, target_schema, target_table, min_value, max_value, granularity):
+def render_range_partition_name(target_table, partition_date, granularity, name_format=None):
+    if name_format:
+        daily_tokens = "{yyyymmdd}" in name_format or all(
+            token in name_format for token in ("{yyyy}", "{mm}", "{dd}")
+        )
+        monthly_tokens = "{yyyymm}" in name_format or all(
+            token in name_format for token in ("{yyyy}", "{mm}")
+        )
+        if granularity == "daily" and not daily_tokens:
+            raise ValueError("Daily range partition name format must uniquely include year, month, and day")
+        if granularity == "monthly" and not monthly_tokens:
+            raise ValueError("Monthly range partition name format must uniquely include year and month")
+        values = {
+            "table": target_table,
+            "yyyy": f"{partition_date.year:04d}",
+            "mm": f"{partition_date.month:02d}",
+            "dd": f"{partition_date.day:02d}",
+            "yyyymm": f"{partition_date.year:04d}{partition_date.month:02d}",
+            "yyyymmdd": f"{partition_date.year:04d}{partition_date.month:02d}{partition_date.day:02d}",
+        }
+        try:
+            return bounded_identifier(name_format.format_map(values), "")
+        except KeyError as error:
+            raise ValueError(f"Unsupported range partition name placeholder: {error}") from error
+    suffix = f"{partition_date.year}_{partition_date.month:02d}_{partition_date.day:02d}" if granularity == "daily" else f"{partition_date.year}_{partition_date.month:02d}"
+    return bounded_identifier(target_table, suffix)
+
+
+def create_range_partitions(target_conn, target_schema, target_table, min_value, max_value, granularity, name_format=None):
     if min_value is None or max_value is None: return
     current = partition_start(min_value, granularity)
     end = next_partition_date(partition_start(max_value, granularity), granularity)
     while current < end:
         next_date = next_partition_date(current, granularity)
-        suffix = f"{current.year}_{current.month:02d}_{current.day:02d}" if granularity == "daily" else f"{current.year}_{current.month:02d}"
-        partition_name = bounded_identifier(target_table, suffix)
+        partition_name = render_range_partition_name(target_table, current, granularity, name_format)
         query = sql.SQL("CREATE TABLE IF NOT EXISTS {schema}.{partition} PARTITION OF {schema}.{parent} FOR VALUES FROM (%s) TO (%s)").format(
             schema=sql.Identifier(target_schema), partition=sql.Identifier(partition_name), parent=sql.Identifier(target_table))
         try:
@@ -745,7 +772,7 @@ def safe_partition_suffix(value):
 
 
 def bounded_identifier(prefix, suffix, max_bytes=63):
-    candidate = f"{prefix}_{suffix}"
+    candidate = f"{prefix}_{suffix}" if suffix else prefix
     if len(candidate.encode("utf-8")) <= max_bytes:
         return candidate
     digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:12]
@@ -756,10 +783,24 @@ def bounded_identifier(prefix, suffix, max_bytes=63):
     return f"{shortened}_{digest}"
 
 
-def create_list_partitions(target_conn, target_schema, target_table, partition_column, values):
+def render_list_partition_name(target_table, partition_column, value, name_format=None):
+    safe_value = safe_partition_suffix(value)
+    if name_format:
+        if "{value}" not in name_format:
+            raise ValueError("List partition name format must include {value}")
+        values = {"table": target_table, "column": partition_column, "value": safe_value}
+        try:
+            return bounded_identifier(name_format.format_map(values), "")
+        except KeyError as error:
+            raise ValueError(f"Unsupported list partition name placeholder: {error}") from error
+    return bounded_identifier(target_table, f"{partition_column}_{safe_value}")
+
+
+def create_list_partitions(target_conn, target_schema, target_table, partition_column, values, name_format=None):
     for value in values:
-        suffix = f"{partition_column}_{safe_partition_suffix(value)}"
-        partition_name = bounded_identifier(target_table, suffix)
+        partition_name = render_list_partition_name(
+            target_table, partition_column, value, name_format
+        )
         query = sql.SQL("CREATE TABLE IF NOT EXISTS {schema}.{partition} PARTITION OF {schema}.{parent} FOR VALUES IN (%s)").format(
             schema=sql.Identifier(target_schema), partition=sql.Identifier(partition_name), parent=sql.Identifier(target_table))
         try:
@@ -776,14 +817,16 @@ def ensure_partitions(source_conn, target_conn, cfg, table_cfg):
     source_schema, target_schema = cfg["source"]["schema"], cfg["target"]["schema"]
     source_table, target_table = table_cfg["source_table"], table_cfg["target_table"]
     partition_column, partition_type = table_cfg.get("partition_column"), table_cfg.get("partition_type")
+    name_format_key = f"{partition_type}_partition_name_format"
+    name_format = table_cfg.get(name_format_key, cfg["migration"].get(name_format_key))
     if not partition_column:
         logging.info(f"[{target_table}] Partition creation skipped"); return
     if partition_type == "range":
         part_min, part_max = get_min_max_column(source_conn, source_schema, source_table, partition_column)
-        create_range_partitions(target_conn, target_schema, target_table, part_min, part_max, cfg["migration"].get("partition_granularity", "monthly"))
+        create_range_partitions(target_conn, target_schema, target_table, part_min, part_max, cfg["migration"].get("partition_granularity", "monthly"), name_format)
     elif partition_type == "list":
         values = get_distinct_partition_values(source_conn, source_schema, source_table, partition_column)
-        create_list_partitions(target_conn, target_schema, target_table, partition_column, values)
+        create_list_partitions(target_conn, target_schema, target_table, partition_column, values, name_format)
     else:
         raise Exception(f"[{target_table}] Invalid partition_type: {partition_type}")
 
@@ -797,6 +840,8 @@ def ensure_partitions_for_rows(target_conn, cfg, table_cfg, source_columns, rows
     target_schema = cfg["target"]["schema"]
     target_table = table_cfg["target_table"]
     partition_type = table_cfg.get("partition_type")
+    name_format_key = f"{partition_type}_partition_name_format"
+    name_format = table_cfg.get(name_format_key, cfg["migration"].get(name_format_key))
     column_index = source_columns.index(partition_column)
     values = [row[column_index] for row in rows if row[column_index] is not None]
     if not values:
@@ -812,6 +857,7 @@ def ensure_partitions_for_rows(target_conn, cfg, table_cfg, source_columns, rows
                 required_start,
                 required_start,
                 granularity,
+                name_format,
             )
     elif partition_type == "list":
         create_list_partitions(
@@ -820,6 +866,7 @@ def ensure_partitions_for_rows(target_conn, cfg, table_cfg, source_columns, rows
             target_table,
             partition_column,
             list(dict.fromkeys(values)),
+            name_format,
         )
     else:
         raise Exception(f"[{target_table}] Invalid partition_type: {partition_type}")

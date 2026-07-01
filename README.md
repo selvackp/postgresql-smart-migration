@@ -78,6 +78,8 @@ All keys below belong under `migration`.
 | `stop_on_table_error` | `false` | Stop the run after one table failure when `true`; otherwise continue with remaining tables. |
 | `create_missing_partitions` | `true` | Create range/list child partitions before loading configured partitioned targets. |
 | `partition_granularity` | `monthly` | Range partition interval: `daily` or `monthly`. |
+| `range_partition_name_format` | Existing convention | Optional range child name template. Supports `{table}`, `{yyyy}`, `{mm}`, `{dd}`, `{yyyymm}`, and `{yyyymmdd}`. |
+| `list_partition_name_format` | Existing convention | Optional list child name template. Supports `{table}`, `{column}`, and `{value}`. |
 | `disable_triggers_globally` | `false` | Disable target USER triggers during each table load. A table can override this setting. |
 | `validate_lengths` | `true` | Validate values written to target `varchar(n)` columns. |
 | `validate_not_null` | `true` | Reject rows containing NULL for target NOT NULL columns after defaults are applied. |
@@ -104,6 +106,8 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `business_key_columns` | Auto-detected | Stable NOT NULL columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. The exact key set must have a non-partial unique index in both source and target. Required for incremental, optional for full load. |
 | `partition_column` | `null` | Target partition key. Use `null` for a non-partitioned target. The column must exist in source and target. |
 | `partition_type` | `null` | `range`, `list`, or `null`. Must match the target parent's PostgreSQL partition strategy. |
+| `range_partition_name_format` | Global setting | Optional per-table override for range partition names. |
+| `list_partition_name_format` | Global setting | Optional per-table override for list partition names. |
 | `column_defaults` | `{}` | Values applied when a source value is NULL, and also used for target-only columns that are not present in the source. |
 | `skip_bad_rows` | Global setting | Optional table override for bad-row behavior. |
 | `disable_triggers_during_load` | Global setting | Optional table override for trigger disable/enable behavior. |
@@ -176,6 +180,12 @@ Non-partitioned source into a range-partitioned target:
 
 For range partitions, each fetched batch creates only the daily or monthly children needed by that batch according to `partition_granularity`.
 
+To create names such as `procmcustmappkey_p20260402`, configure:
+
+```yaml
+range_partition_name_format: "{table}_p{yyyymmdd}"
+```
+
 Non-partitioned source into a list-partitioned target:
 
 ```yaml
@@ -195,6 +205,14 @@ Non-partitioned source into a list-partitioned target:
 ```
 
 For list partitions, each fetched batch creates children for the distinct non-NULL partition values in that batch.
+
+To create names such as `procmcust_p4101`, configure:
+
+```yaml
+list_partition_name_format: "{table}_p{value}"
+```
+
+Both format keys can be defined globally under `migration` or overridden inside an individual table entry. Existing partitions are matched by their bounds, so changing the format affects only newly created partitions.
 
 ### Partition requirements
 

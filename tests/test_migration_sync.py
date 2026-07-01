@@ -82,6 +82,34 @@ class MigrationSafetyTests(unittest.TestCase):
         self.assertLessEqual(len(name.encode("utf-8")), 63)
         self.assertEqual(name, migration.bounded_identifier("x" * 60, "2026_01_01"))
 
+    def test_configured_range_partition_name(self):
+        name = migration.render_range_partition_name(
+            "procmcustmappkey",
+            date(2026, 4, 2),
+            "daily",
+            "{table}_p{yyyymmdd}",
+        )
+        self.assertEqual(name, "procmcustmappkey_p20260402")
+
+    def test_configured_list_partition_name(self):
+        name = migration.render_list_partition_name(
+            "procmcust",
+            "custid",
+            4101,
+            "{table}_p{value}",
+        )
+        self.assertEqual(name, "procmcust_p4101")
+
+    def test_partition_formats_must_include_unique_value(self):
+        with self.assertRaises(ValueError):
+            migration.render_range_partition_name(
+                "orders", date(2026, 4, 2), "daily", "{table}_p{yyyymm}"
+            )
+        with self.assertRaises(ValueError):
+            migration.render_list_partition_name(
+                "customers", "custid", 4101, "{table}_partition"
+            )
+
     def test_range_partition_discovery_creates_only_periods_present_in_batch(self):
         cfg = {
             "target": {"schema": "public"},

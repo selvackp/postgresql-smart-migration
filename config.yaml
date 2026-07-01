@@ -26,6 +26,8 @@ migration:
   create_missing_partitions: true
   disable_triggers_globally: true
   partition_granularity: "daily"   # daily or monthly
+  range_partition_name_format: "{table}_p{yyyymmdd}"
+  list_partition_name_format: "{table}_p{value}"
   validate_lengths: true
   validate_not_null: true
   truncate_long_strings: false

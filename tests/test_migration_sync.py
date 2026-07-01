@@ -114,6 +114,20 @@ class MigrationSafetyTests(unittest.TestCase):
         )
         self.assertEqual(compatible, (True, True))
 
+    def test_double_precision_to_numeric_is_compatible(self):
+        compatible = migration.is_type_compatible(
+            {"data_type": "double precision", "udt_name": "float8"},
+            {"data_type": "numeric", "udt_name": "numeric"},
+        )
+        self.assertEqual(compatible, (True, True))
+
+    def test_varchar_to_fixed_character_is_compatible(self):
+        compatible = migration.is_type_compatible(
+            {"data_type": "character varying", "udt_name": "varchar"},
+            {"data_type": "character", "udt_name": "bpchar"},
+        )
+        self.assertEqual(compatible, (True, True))
+
     def test_sequence_reset_uses_next_value_after_table_maximum(self):
         self.assertEqual(
             migration.calculate_next_sequence_value(100, 1, True, 1, 1),

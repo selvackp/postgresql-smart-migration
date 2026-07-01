@@ -254,6 +254,7 @@ def validate_business_key_safety(
     source_meta,
     target_meta,
     business_key_columns,
+    load_type="incremental",
 ):
     if not business_key_columns:
         return
@@ -291,8 +292,13 @@ def validate_business_key_safety(
             f"[{target_table}] Source business key {business_key_columns} is unique in current data but is not index-backed"
         )
     if not has_matching_unique_index(target_conn, target_schema, target_table, business_key_columns):
-        raise PreMigrationValidationError(
-            f"[{target_table}] Target business key {business_key_columns} is not backed by a non-partial unique index"
+        if load_type == "incremental":
+            raise PreMigrationValidationError(
+                f"[{target_table}] Target business key {business_key_columns} is not backed by a non-partial unique index"
+            )
+        logging.warning(
+            f"[{target_table}] Full load proceeding without a target unique index for business key "
+            f"{business_key_columns}; merge performance and concurrent-write protection may be reduced"
         )
 
 def normalize_type_name(meta):
@@ -624,6 +630,7 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
         source_meta,
         target_meta,
         business_key_columns,
+        load_type,
     )
     partition_column = table_cfg.get("partition_column")
     if partition_column and partition_column not in source_columns: raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} not found in source and target")

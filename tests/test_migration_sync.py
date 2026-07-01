@@ -49,6 +49,27 @@ class MigrationSafetyTests(unittest.TestCase):
                 metadata, metadata, ["id"]
             )
 
+    def test_full_load_allows_target_key_without_unique_index(self):
+        metadata = {"rptid": {"is_nullable": "NO"}}
+        with mock.patch.object(
+            migration, "has_matching_unique_index", side_effect=[True, False]
+        ):
+            migration.validate_business_key_safety(
+                object(), object(), "public", "public", "reportscheduler", "reportscheduler",
+                metadata, metadata, ["rptid"], load_type="full"
+            )
+
+    def test_incremental_load_requires_target_unique_index(self):
+        metadata = {"rptid": {"is_nullable": "NO"}}
+        with mock.patch.object(
+            migration, "has_matching_unique_index", side_effect=[True, False]
+        ):
+            with self.assertRaises(migration.PreMigrationValidationError):
+                migration.validate_business_key_safety(
+                    object(), object(), "public", "public", "reportscheduler", "reportscheduler",
+                    metadata, metadata, ["rptid"], load_type="incremental"
+                )
+
     def test_nullable_source_key_is_rejected_when_data_contains_null(self):
         source_metadata = {"id": {"is_nullable": "YES"}}
         target_metadata = {"id": {"is_nullable": "NO"}}

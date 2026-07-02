@@ -80,6 +80,8 @@ All keys below belong under `migration`.
 | `partition_granularity` | `monthly` | Range partition interval: `daily` or `monthly`. |
 | `range_partition_name_format` | Existing convention | Optional range child name template. Supports `{table}`, `{yyyy}`, `{mm}`, `{dd}`, `{yyyymm}`, and `{yyyymmdd}`. |
 | `list_partition_name_format` | Existing convention | Optional list child name template. Supports `{table}`, `{column}`, and `{value}`. |
+| `create_default_partition` | `true` | After a configured partitioned table finishes loading, ensure one DEFAULT child exists as a safety catch-all. |
+| `default_partition_name_format` | `{table}_default` | Optional DEFAULT child name template. Supports `{table}`. |
 | `disable_triggers_globally` | `false` | Disable target USER triggers during each table load. A table can override this setting. |
 | `validate_lengths` | `true` | Validate values written to target `varchar(n)` columns. |
 | `validate_not_null` | `true` | Reject rows containing NULL for target NOT NULL columns after defaults are applied. |
@@ -110,6 +112,8 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `partition_type` | `null` | `range`, `list`, or `null`. Must match the target parent's PostgreSQL partition strategy. |
 | `range_partition_name_format` | Global setting | Optional per-table override for range partition names. |
 | `list_partition_name_format` | Global setting | Optional per-table override for list partition names. |
+| `create_default_partition` | Global setting | Optional per-table override for automatic DEFAULT partition creation. |
+| `default_partition_name_format` | Global setting | Optional per-table override for the DEFAULT partition name. |
 | `column_defaults` | `{}` | Values applied when a source value is NULL, and also used for target-only columns that are not present in the source. |
 | `skip_bad_rows` | Global setting | Optional table override for bad-row behavior. |
 | `disable_triggers_during_load` | Global setting | Optional table override for trigger disable/enable behavior. |
@@ -230,6 +234,8 @@ list_partition_name_format: "{table}_p{value}"
 ```
 
 Both format keys can be defined globally under `migration` or overridden inside an individual table entry. Existing partitions are matched by their bounds, so changing the format affects only newly created partitions.
+
+After a configured range/list table finishes loading, the script creates `{table}_default` when no DEFAULT child already exists. This catch-all prevents later inserts from failing when no explicit child covers a value. Before attaching a future range/list partition, move or remove any matching rows from the DEFAULT partition; PostgreSQL will reject an overlapping child while matching rows remain there. Set `create_default_partition: false` globally or per table to disable this behavior.
 
 ### Partition requirements
 

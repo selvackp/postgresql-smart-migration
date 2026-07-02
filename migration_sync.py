@@ -867,6 +867,67 @@ def bounded_identifier(prefix, suffix, max_bytes=63):
     return f"{shortened}_{digest}"
 
 
+def render_default_partition_name(target_table, name_format=None):
+    if not name_format:
+        return bounded_identifier(target_table, "default")
+    try:
+        return bounded_identifier(name_format.format_map({"table": target_table}), "")
+    except KeyError as error:
+        raise ValueError(f"Unsupported default partition name placeholder: {error}") from error
+
+
+def get_default_partition(target_conn, target_schema, target_table):
+    query = """
+        SELECT child.relname
+        FROM pg_inherits inheritance
+        JOIN pg_class parent ON parent.oid = inheritance.inhparent
+        JOIN pg_namespace parent_schema ON parent_schema.oid = parent.relnamespace
+        JOIN pg_class child ON child.oid = inheritance.inhrelid
+        WHERE parent_schema.nspname = %s
+          AND parent.relname = %s
+          AND pg_get_expr(child.relpartbound, child.oid) = 'DEFAULT'
+        LIMIT 1
+    """
+    with target_conn.cursor() as cur:
+        cur.execute(query, (target_schema, target_table))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def ensure_default_partition(target_conn, cfg, table_cfg):
+    if not table_cfg.get("partition_column"):
+        return None
+    enabled = table_cfg.get(
+        "create_default_partition",
+        cfg["migration"].get("create_default_partition", True),
+    )
+    if not enabled:
+        return None
+    target_schema = cfg["target"]["schema"]
+    target_table = table_cfg["target_table"]
+    existing = get_default_partition(target_conn, target_schema, target_table)
+    if existing:
+        logging.info(f"[{target_table}] Default partition already exists: {existing}")
+        return existing
+    name_format = table_cfg.get(
+        "default_partition_name_format",
+        cfg["migration"].get("default_partition_name_format"),
+    )
+    partition_name = render_default_partition_name(target_table, name_format)
+    query = sql.SQL(
+        "CREATE TABLE {schema}.{partition} PARTITION OF {schema}.{parent} DEFAULT"
+    ).format(
+        schema=sql.Identifier(target_schema),
+        partition=sql.Identifier(partition_name),
+        parent=sql.Identifier(target_table),
+    )
+    with target_conn.cursor() as cur:
+        cur.execute(query)
+    target_conn.commit()
+    logging.info(f"[{target_table}] Default partition created: {partition_name}")
+    return partition_name
+
+
 def render_list_partition_name(target_table, partition_column, value, name_format=None):
     safe_value = safe_partition_suffix(value)
     if name_format:
@@ -1929,6 +1990,9 @@ def main():
                 )
                 if reconciliation:
                     reconciliation_results.append(reconciliation)
+
+                # Add a catch-all child only after all expected batch partitions are loaded.
+                ensure_default_partition(target_conn, cfg, table_cfg)
 
                 # Reset sequence-backed columns after successful full or incremental load.
                 if should_reset_sequences(cfg):

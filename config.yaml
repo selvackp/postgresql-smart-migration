@@ -28,6 +28,8 @@ migration:
   partition_granularity: "daily"   # daily or monthly
   range_partition_name_format: "{table}_p{yyyymmdd}"
   list_partition_name_format: "{table}_p{value}"
+  create_default_partition: true
+  default_partition_name_format: "{table}_default"
   validate_lengths: true
   validate_not_null: true
   truncate_long_strings: false

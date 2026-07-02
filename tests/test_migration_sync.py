@@ -27,9 +27,13 @@ class FakeConnection:
     def __init__(self, rows=None):
         self.rows = rows or []
         self.executions = []
+        self.commits = 0
 
     def cursor(self):
         return FakeCursor(self)
+
+    def commit(self):
+        self.commits += 1
 
 
 class RowDatabaseError(Exception):
@@ -202,6 +206,35 @@ class MigrationSafetyTests(unittest.TestCase):
             "{table}_p{value}",
         )
         self.assertEqual(name, "procmcust_p4101")
+
+    def test_default_partition_created_after_partitioned_table_load(self):
+        connection = FakeConnection()
+        cfg = {
+            "target": {"schema": "public"},
+            "migration": {
+                "create_default_partition": True,
+                "default_partition_name_format": "{table}_default",
+            },
+        }
+        table_cfg = {
+            "target_table": "procmcust",
+            "partition_column": "chnid",
+        }
+        with mock.patch.object(migration, "get_default_partition", return_value=None):
+            name = migration.ensure_default_partition(connection, cfg, table_cfg)
+        self.assertEqual(name, "procmcust_default")
+        self.assertEqual(connection.commits, 1)
+
+    def test_existing_default_partition_is_reused(self):
+        connection = FakeConnection()
+        cfg = {"target": {"schema": "public"}, "migration": {}}
+        table_cfg = {"target_table": "orders", "partition_column": "created_at"}
+        with mock.patch.object(
+            migration, "get_default_partition", return_value="orders_catchall"
+        ):
+            name = migration.ensure_default_partition(connection, cfg, table_cfg)
+        self.assertEqual(name, "orders_catchall")
+        self.assertEqual(connection.commits, 0)
 
     def test_partition_formats_must_include_unique_value(self):
         with self.assertRaises(ValueError):

@@ -233,7 +233,9 @@ class MigrationSafetyTests(unittest.TestCase):
             "partition_column": "chnid",
         }
         with mock.patch.object(migration, "get_default_partition", return_value=None):
-            name = migration.ensure_default_partition(connection, cfg, table_cfg)
+            name = migration.ensure_default_partition(
+                connection, cfg, table_cfg, load_type="incremental"
+            )
         self.assertEqual(name, "procmcust_default")
         self.assertEqual(connection.commits, 1)
 
@@ -244,9 +246,21 @@ class MigrationSafetyTests(unittest.TestCase):
         with mock.patch.object(
             migration, "get_default_partition", return_value="orders_catchall"
         ):
-            name = migration.ensure_default_partition(connection, cfg, table_cfg)
+            name = migration.ensure_default_partition(
+                connection, cfg, table_cfg, load_type="incremental"
+            )
         self.assertEqual(name, "orders_catchall")
         self.assertEqual(connection.commits, 0)
+
+    def test_full_load_does_not_create_default_partition(self):
+        connection = FakeConnection()
+        cfg = {"target": {"schema": "public"}, "migration": {}}
+        table_cfg = {"target_table": "orders", "partition_column": "created_at"}
+        name = migration.ensure_default_partition(
+            connection, cfg, table_cfg, load_type="full"
+        )
+        self.assertIsNone(name)
+        self.assertEqual(connection.executions, [])
 
     def test_partition_formats_must_include_unique_value(self):
         with self.assertRaises(ValueError):

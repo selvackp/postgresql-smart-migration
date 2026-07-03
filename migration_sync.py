@@ -894,7 +894,9 @@ def get_default_partition(target_conn, target_schema, target_table):
     return row[0] if row else None
 
 
-def ensure_default_partition(target_conn, cfg, table_cfg):
+def ensure_default_partition(target_conn, cfg, table_cfg, load_type):
+    if load_type != "incremental":
+        return None
     if not table_cfg.get("partition_column"):
         return None
     enabled = table_cfg.get(
@@ -2040,7 +2042,7 @@ def main():
                     reconciliation_results.append(reconciliation)
 
                 # Add a catch-all child only after all expected batch partitions are loaded.
-                ensure_default_partition(target_conn, cfg, table_cfg)
+                ensure_default_partition(target_conn, cfg, table_cfg, load_type)
 
                 # Reset sequence-backed columns after successful full or incremental load.
                 if should_reset_sequences(cfg):

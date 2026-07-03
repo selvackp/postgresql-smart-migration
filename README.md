@@ -75,6 +75,7 @@ All keys below belong under `migration`.
 | `error_table` | Required | Target table used for rejected rows; it is created automatically. |
 | `timezone` | `UTC` | Session timezone applied to source and target connections. It does not rewrite `timestamp without time zone` values. |
 | `default_load_type` | `incremental` | Load type used when a table does not define `load_type`. |
+| `truncate_target_before_full_load` | `false` | On a full load with no existing table checkpoint, truncate the target before reading batches. Truncating a partitioned parent includes all child partition data but keeps partition definitions. Never uses `CASCADE`. A table can override this setting. |
 | `stop_on_table_error` | `false` | Stop the run after one table failure when `true`; otherwise continue with remaining tables. |
 | `create_missing_partitions` | `true` | Create range/list child partitions before loading configured partitioned targets. |
 | `partition_granularity` | `monthly` | Range partition interval: `daily` or `monthly`. |
@@ -104,7 +105,8 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `source_table` | Required | Source table name in `source.schema`. |
 | `target_table` | Required | Target table name in `target.schema`. Names may differ. |
 | `enabled` | `true` | Set `false` to skip this table without deleting its configuration. |
-| `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Incremental requires a business/PK/unique key. Full load merges by key when one exists, or uses insert-only mode when no key exists. Full load does not truncate the target. |
+| `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Incremental requires a business/PK/unique key. Full load merges by key when one exists, or uses insert-only mode when no key exists. Full load truncates only when `truncate_target_before_full_load: true` is explicitly enabled. |
+| `truncate_target_before_full_load` | Global setting | Optional per-table opt-in to empty the target only on the first checkpoint-free full-load attempt. Resume runs do not truncate again. |
 | `incremental_column` | Incremental only | Source/target column used for high-watermark ordering, such as `updated_at` or `crtdate`. NULL values are not selected. |
 | `business_key_columns` | Auto-detected | Stable, non-NULL data columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. Incremental loads require a matching non-partial target unique index; full loads only warn when it is absent. When the source lacks one, the script scans current source data for NULL and duplicate keys before loading. Required for incremental, optional for full load. |
 | `allow_incremental_without_target_unique_index` | Global setting | Optional per-table opt-in for legacy targets that cannot add a unique index. Current target keys are checked for duplicates before loading. |
@@ -166,6 +168,20 @@ Full UPSERT into a non-partitioned target:
     - customer_id
   column_defaults: {}
 ```
+
+Source-authoritative first full load that starts from an empty target:
+
+```yaml
+- source_table: prosmchn
+  target_table: prosmchn
+  enabled: true
+  load_type: full
+  business_key_columns:
+    - chnid
+  truncate_target_before_full_load: true
+```
+
+This option issues `TRUNCATE TABLE schema.table` only when that table has no checkpoint entry, then immediately records a `TRUNCATED` checkpoint before loading batches. For a partitioned parent, PostgreSQL clears all child/default partition data and retains the partition definitions. The script does not use `CASCADE`; foreign-key dependencies must be handled explicitly before the run.
 
 A completed full load is skipped on later runs while its checkpoint status is `COMPLETED`. Remove only that table's checkpoint entry when an intentional full rerun is required.
 

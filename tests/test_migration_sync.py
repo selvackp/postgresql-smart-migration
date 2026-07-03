@@ -22,6 +22,9 @@ class FakeCursor:
     def fetchall(self):
         return self.connection.rows
 
+    def fetchone(self):
+        return self.connection.rows[0] if self.connection.rows else None
+
 
 class FakeConnection:
     def __init__(self, rows=None):
@@ -41,6 +44,15 @@ class RowDatabaseError(Exception):
 
 
 class MigrationSafetyTests(unittest.TestCase):
+    def test_initial_full_load_truncates_parent_and_child_partition_data(self):
+        connection = FakeConnection(rows=[(4,)])
+        partition_count = migration.truncate_target_for_initial_full_load(
+            connection, "public", "orders"
+        )
+        self.assertEqual(partition_count, 4)
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(len(connection.executions), 2)
+
     def test_source_key_without_unique_index_is_allowed_when_data_is_unique(self):
         metadata = {"id": {"is_nullable": "NO"}}
         with mock.patch.object(

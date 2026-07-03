@@ -22,6 +22,7 @@ migration:
   error_table: "migration_error_log"
   timezone: "Asia/Kolkata"
   default_load_type: "incremental"
+  truncate_target_before_full_load: false
   stop_on_table_error: false
   create_missing_partitions: true
   disable_triggers_globally: true

@@ -9,6 +9,7 @@ import ast
 import argparse
 import base64
 import hashlib
+import re
 from datetime import datetime, timedelta, date
 from decimal import Decimal
 from uuid import UUID
@@ -113,20 +114,102 @@ def get_table_columns(conn, schema_name, table_name):
     with conn.cursor() as cur:
         cur.execute(query, (schema_name, table_name))
         rows = cur.fetchall()
-    return {
-        r[0]: {
-            "data_type": r[1],
-            "udt_name": r[2],
-            "max_length": r[3],
-            "numeric_precision": r[4],
-            "numeric_scale": r[5],
-            "is_nullable": r[6],
-            "column_default": r[7],
-            "is_identity": r[8],
-            "identity_generation": r[9],
+    if rows:
+        return {
+            r[0]: {
+                "data_type": r[1],
+                "udt_name": r[2],
+                "max_length": r[3],
+                "numeric_precision": r[4],
+                "numeric_scale": r[5],
+                "is_nullable": r[6],
+                "column_default": r[7],
+                "is_identity": r[8],
+                "identity_generation": r[9],
+            }
+            for r in rows
         }
-        for r in rows
+
+    fallback_query = """
+        SELECT
+            attribute.attname,
+            type_info.typname,
+            pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+            attribute.attnotnull,
+            pg_get_expr(default_info.adbin, default_info.adrelid),
+            attribute.attidentity
+        FROM pg_class relation
+        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+        JOIN pg_attribute attribute ON attribute.attrelid = relation.oid
+        JOIN pg_type type_info ON type_info.oid = attribute.atttypid
+        LEFT JOIN pg_attrdef default_info
+          ON default_info.adrelid = relation.oid
+         AND default_info.adnum = attribute.attnum
+        WHERE namespace.nspname = %s
+          AND relation.relname = %s
+          AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+        ORDER BY attribute.attnum
+    """
+    with conn.cursor() as cur:
+        cur.execute(fallback_query, (schema_name, table_name))
+        fallback_rows = cur.fetchall()
+    if fallback_rows:
+        logging.warning(
+            f"[{table_name}] Column metadata loaded from pg_catalog fallback"
+        )
+    return metadata_from_pg_catalog_rows(fallback_rows)
+
+
+def metadata_from_pg_catalog_rows(rows):
+    metadata = {}
+    for column_name, udt_name, formatted_type, not_null, column_default, identity_code in rows:
+        data_type, max_length, numeric_precision, numeric_scale = parse_formatted_pg_type(
+            formatted_type, udt_name
+        )
+        metadata[column_name] = {
+            "data_type": data_type,
+            "udt_name": udt_name,
+            "max_length": max_length,
+            "numeric_precision": numeric_precision,
+            "numeric_scale": numeric_scale,
+            "is_nullable": "NO" if not_null else "YES",
+            "column_default": column_default,
+            "is_identity": "YES" if identity_code else "NO",
+            "identity_generation": "ALWAYS" if identity_code == "a" else "BY DEFAULT" if identity_code == "d" else None,
+        }
+    return metadata
+
+
+def parse_formatted_pg_type(formatted_type, udt_name):
+    formatted = str(formatted_type).lower()
+    if formatted.endswith("[]"):
+        return "ARRAY", None, None, None
+    varchar_match = re.fullmatch(r"character varying\((\d+)\)", formatted)
+    if varchar_match:
+        return "character varying", int(varchar_match.group(1)), None, None
+    character_match = re.fullmatch(r"character\((\d+)\)", formatted)
+    if character_match:
+        return "character", int(character_match.group(1)), None, None
+    numeric_match = re.fullmatch(r"numeric\((\d+),(\d+)\)", formatted)
+    if numeric_match:
+        return "numeric", None, int(numeric_match.group(1)), int(numeric_match.group(2))
+    formatted = re.sub(r"timestamp\(\d+\)", "timestamp", formatted)
+    formatted = re.sub(r"time\(\d+\)", "time", formatted)
+    aliases = {
+        "int2": "smallint",
+        "int4": "integer",
+        "int8": "bigint",
+        "float4": "real",
+        "float8": "double precision",
+        "bool": "boolean",
+        "varchar": "character varying",
+        "bpchar": "character",
+        "timestamptz": "timestamp with time zone",
+        "timestamp": "timestamp without time zone",
     }
+    return aliases.get(formatted, aliases.get(udt_name, formatted)), None, None, None
 
 def get_primary_key_columns(conn, schema_name, table_name):
     query = """

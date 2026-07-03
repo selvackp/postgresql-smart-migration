@@ -44,6 +44,27 @@ class RowDatabaseError(Exception):
 
 
 class MigrationSafetyTests(unittest.TestCase):
+    def test_pg_catalog_view_metadata_fallback(self):
+        metadata = migration.metadata_from_pg_catalog_rows([
+            ("id", "int8", "bigint", False, None, ""),
+            ("name", "varchar", "character varying(200)", False, None, ""),
+            ("created_at", "timestamp", "timestamp(6) without time zone", False, None, ""),
+        ])
+        self.assertEqual(metadata["id"]["data_type"], "bigint")
+        self.assertEqual(metadata["name"]["max_length"], 200)
+        self.assertEqual(
+            metadata["created_at"]["data_type"], "timestamp without time zone"
+        )
+
+    def test_pg_catalog_array_and_numeric_metadata(self):
+        metadata = migration.metadata_from_pg_catalog_rows([
+            ("amount", "numeric", "numeric(20,4)", False, None, ""),
+            ("tags", "_text", "text[]", False, None, ""),
+        ])
+        self.assertEqual(metadata["amount"]["numeric_precision"], 20)
+        self.assertEqual(metadata["amount"]["numeric_scale"], 4)
+        self.assertEqual(metadata["tags"]["data_type"], "ARRAY")
+
     def test_initial_full_load_truncates_parent_and_child_partition_data(self):
         connection = FakeConnection(rows=[(4,)])
         partition_count = migration.truncate_target_for_initial_full_load(

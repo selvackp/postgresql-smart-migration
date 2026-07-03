@@ -181,7 +181,7 @@ Source-authoritative first full load that starts from an empty target:
   truncate_target_before_full_load: true
 ```
 
-This option issues `TRUNCATE TABLE schema.table` only when that table has no checkpoint entry, then immediately records a `TRUNCATED` checkpoint before loading batches. For a partitioned parent, PostgreSQL clears all child/default partition data and retains the partition definitions. The script does not use `CASCADE`; foreign-key dependencies must be handled explicitly before the run.
+This option applies only to enabled full-load table entries in the active config. After source/target existence validation, it issues `TRUNCATE TABLE schema.table RESTART IDENTITY` only when that table has no checkpoint entry, then immediately records a `TRUNCATED` checkpoint before loading batches. Missing source/target tables are logged and skipped before truncation. For a partitioned parent, PostgreSQL clears all child/default partition data and retains the partition definitions. The script does not use `CASCADE`; foreign-key dependencies must be handled explicitly before the run. Owned sequences restart during truncation and are synchronized again to migrated maximum values after the load.
 
 A completed full load is skipped on later runs while its checkpoint status is `COMPLETED`. Remove only that table's checkpoint entry when an intentional full rerun is required.
 

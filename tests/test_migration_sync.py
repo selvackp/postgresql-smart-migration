@@ -52,6 +52,7 @@ class MigrationSafetyTests(unittest.TestCase):
         self.assertEqual(partition_count, 4)
         self.assertEqual(connection.commits, 1)
         self.assertEqual(len(connection.executions), 2)
+        self.assertIn("RESTART IDENTITY", str(connection.executions[1][0]))
 
     def test_source_key_without_unique_index_is_allowed_when_data_is_unique(self):
         metadata = {"id": {"is_nullable": "NO"}}

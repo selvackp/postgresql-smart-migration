@@ -1407,14 +1407,14 @@ def truncate_target_for_initial_full_load(target_conn, target_schema, target_tab
         cur.execute(partition_query, (target_schema, target_table))
         partition_count = int(cur.fetchone()[0])
         cur.execute(
-            sql.SQL("TRUNCATE TABLE {schema}.{table}").format(
+            sql.SQL("TRUNCATE TABLE {schema}.{table} RESTART IDENTITY").format(
                 schema=sql.Identifier(target_schema),
                 table=sql.Identifier(target_table),
             )
         )
     target_conn.commit()
     logging.warning(
-        f"[{target_table}] Initial full-load target truncated; "
+        f"[{target_table}] Initial full-load target truncated with RESTART IDENTITY; "
         f"child partitions included={partition_count}"
     )
     return partition_count

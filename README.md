@@ -102,7 +102,7 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 
 | Key | Required/default | Meaning |
 | --- | --- | --- |
-| `source_table` | Required | Source table or normal view name in `source.schema`. Metadata uses `information_schema.columns` with a `pg_catalog` fallback for accessible views. |
+| `source_table` | Required | Source table name in `source.schema`. |
 | `target_table` | Required | Target table name in `target.schema`. Names may differ. |
 | `enabled` | `true` | Set `false` to skip this table without deleting its configuration. |
 | `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Incremental requires a business/PK/unique key. Full load merges by key when one exists, or uses insert-only mode when no key exists. Full load truncates only when `truncate_target_before_full_load: true` is explicitly enabled. |

@@ -47,9 +47,9 @@ class MigrationSafetyTests(unittest.TestCase):
             "insert_only": True,
             "allow_duplicates": True,
         }
-        self.assertTrue(migration.is_incremental_insert_only_duplicate_mode(enabled))
-        self.assertFalse(migration.is_incremental_insert_only_duplicate_mode({**enabled, "allow_duplicates": False}))
-        self.assertFalse(migration.is_incremental_insert_only_duplicate_mode({**enabled, "load_type": "full"}))
+        self.assertTrue(migration.is_incremental_insert_only(enabled, "incremental"))
+        self.assertFalse(migration.is_incremental_insert_only({**enabled, "allow_duplicates": False}, "incremental"))
+        self.assertFalse(migration.is_incremental_insert_only(enabled, "full"))
 
     def test_incremental_insert_only_fetch_uses_only_incremental_cursor(self):
         connection = FakeConnection(rows=[(1, "2026-07-04")])
@@ -62,23 +62,40 @@ class MigrationSafetyTests(unittest.TestCase):
             "2026-07-04 00:00:00",
             "2026-07-05 00:00:00",
             20000,
+            17,
         )
         query, params = connection.executions[-1]
         query_text = str(query)
         self.assertEqual(rows, [(1, "2026-07-04")])
-        self.assertEqual(params, ("2026-07-04 00:00:00", "2026-07-05 00:00:00", 20000))
-        self.assertIn("ORDER BY ", query_text)
+        self.assertEqual(params, [
+            "2026-07-04 00:00:00",
+            "2026-07-05 00:00:00",
+            "2026-07-04 00:00:00",
+            "2026-07-04 00:00:00",
+            17,
+            20000,
+        ])
+        self.assertIn("ROW_NUMBER()", query_text)
         self.assertNotIn("business", query_text.lower())
 
-    def test_incremental_insert_only_insert_has_no_conflict_clause(self):
+    def test_incremental_insert_only_uses_existing_insert_path(self):
         connection = FakeConnection(rows=[(1,), (2,)])
-        updated, inserted = migration.insert_from_temp_allow_duplicates(
+        updated, inserted = migration.insert_from_temp_only(
             connection, "public", "target_table", "temp_table", ["id"]
         )
         query_text = str(connection.executions[-1][0])
         self.assertEqual((updated, inserted), (0, 2))
-        self.assertNotIn("ON CONFLICT", query_text)
+        self.assertIn("ON CONFLICT DO NOTHING", query_text)
         self.assertNotIn("UPDATE", query_text)
+
+    def test_incremental_seen_count_counts_last_timestamp_rows(self):
+        count = migration.count_incremental_value_in_rows(
+            [(1, 10), (2, 10), (3, 11)],
+            ["id", "crtdate"],
+            "crtdate",
+            10,
+        )
+        self.assertEqual(count, 2)
 
     def test_incremental_insert_only_metadata_skips_business_key_checks(self):
         meta = {
@@ -102,18 +119,17 @@ class MigrationSafetyTests(unittest.TestCase):
             "target_table": "target_table",
             "load_type": "incremental",
             "incremental_column": "crtdate",
-            "business_key_columns": ["missing_key"],
             "insert_only": True,
             "allow_duplicates": True,
         }
         with mock.patch.object(migration, "get_table_columns", side_effect=[meta, meta]), \
-             mock.patch.object(migration, "detect_business_key") as detect_key, \
+             mock.patch.object(migration, "detect_business_key", return_value=["crtdate"]) as detect_key, \
              mock.patch.object(migration, "validate_business_key_safety") as validate_key:
             result = migration.prepare_metadata(
                 object(), object(), cfg, table_cfg, "incremental"
             )
         self.assertEqual(result[-1], [])
-        detect_key.assert_not_called()
+        detect_key.assert_called_once()
         validate_key.assert_not_called()
 
     def test_source_key_without_unique_index_is_allowed_when_data_is_unique(self):

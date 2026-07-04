@@ -116,12 +116,12 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `source_table` | Required | Source table name in `source.schema`. |
 | `target_table` | Required | Target table name in `target.schema`. Names may differ. |
 | `enabled` | `true` | Set `false` to skip this table without deleting its configuration. |
-| `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Incremental requires a business/PK/unique key. Full load merges by key when one exists, or uses insert-only mode when no key exists. Full load does not truncate the target. |
+| `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Normal incremental mode requires a business/PK/unique key. The explicitly enabled incremental insert-only duplicate mode does not. Full load merges by key when one exists, or uses insert-only mode when no key exists. Full load does not truncate the target. |
 | `incremental_column` | Incremental only | Source/target column used for high-watermark ordering, such as `updated_at` or `crtdate`. NULL values are not selected. |
-| `business_key_columns` | Auto-detected | Stable, non-NULL data columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. Incremental loads require a matching non-partial target unique index; full loads only warn when it is absent. When the source lacks one, the script scans current source data for NULL and duplicate keys before loading. Required for incremental, optional for full load. |
+| `business_key_columns` | Auto-detected | Stable, non-NULL data columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. Normal incremental loads require a matching non-partial target unique index; full loads only warn when it is absent. When the source lacks one, the script scans current source data for NULL and duplicate keys before loading. Required for normal incremental mode, ignored by incremental insert-only duplicate mode, and optional for full load. |
 | `insert_only` | `false` | With `load_type: incremental` and `allow_duplicates: true`, enables table-level cursor-only inserts without UPSERT. |
 | `allow_duplicates` | `false` | Completes the explicit opt-in for incremental insert-only duplicate mode. No business-key uniqueness or target unique-index validation is performed. |
-| `initial_incremental_value` | Source minimum fallback | Starting exclusive incremental value used only when this mode has no checkpoint. |
+| `initial_incremental_value` | Optional | One-time exclusive starting value for incremental insert-only duplicate mode. It is read only when that table has no checkpoint entry. |
 | `allow_incremental_without_target_unique_index` | Global setting | Optional per-table opt-in for legacy targets that cannot add a unique index. Current target keys are checked for duplicates before loading. |
 | `partition_column` | `null` | Target partition key. Use `null` for a non-partitioned target. The column must exist in source and target. |
 | `partition_type` | `null` | `range`, `list`, or `null`. Must match the target parent's PostgreSQL partition strategy. |
@@ -150,7 +150,9 @@ For a legacy incremental target that cannot add a unique index, opt in explicitl
 
 The script verifies that current target `id` values are not duplicated before loading. Keep application writes controlled during migration because the database still cannot enforce uniqueness.
 
-For an append-only incremental table where duplicate business keys are intentional:
+### Incremental insert-only duplicate mode
+
+Use this mode only for selected append-only incremental tables where duplicate business-key values, including NULL key values, are intentional. It is enabled only when all three settings are present: `load_type: incremental`, `insert_only: true`, and `allow_duplicates: true`. Other tables continue to use the normal keyed UPSERT path.
 
 ```yaml
 - source_table: profactcustthreatprofile1
@@ -159,10 +161,6 @@ For an append-only incremental table where duplicate business keys are intention
   incremental_column: crtdate
   partition_column: null
   partition_type: null
-  business_key_columns:
-    - custid
-    - ruleid
-    - crtdate
   insert_only: true
   allow_duplicates: true
   initial_incremental_value: "2026-07-04 00:00:00"
@@ -170,7 +168,13 @@ For an append-only incremental table where duplicate business keys are intention
   enabled: true
 ```
 
-This mode reads only `incremental_column > last_incremental_value` through the captured high watermark, inserts without updates or `ON CONFLICT`, and checkpoints only `last_incremental_value`. PostgreSQL constraints still apply; rejected rows are isolated and logged. Because the cursor is exclusive and has no key tie-breaker, use an incremental column granular enough that one value cannot span a batch boundary.
+`initial_incremental_value` is optional. Set it once to the desired starting boundary; do not update it after each run. When no checkpoint exists, the first query reads rows where `incremental_column > initial_incremental_value`. If it is omitted, the script derives a value immediately before the current source minimum.
+
+After every committed batch, the table checkpoint stores only `last_incremental_value`. That checkpoint takes precedence over `initial_incremental_value` on every later run. The configured initial value is used again only if the table's checkpoint entry or the entire checkpoint file is removed. Moving the initial value backward after removing a checkpoint can intentionally insert duplicate rows.
+
+This mode does not compare business keys, validate duplicate keys, require a target unique index, update existing rows, or add `ON CONFLICT DO NOTHING`. Configured `business_key_columns` may be omitted; if present, they are ignored by this mode. `allow_duplicates` disables migration-level duplicate protection, but PostgreSQL target constraints still apply. Rows rejected by NOT NULL, unique, datatype, or other target constraints are isolated and written to `migration_error_log`.
+
+Rows are fetched with an exclusive cursor ordered only by `incremental_column`, up to the run's captured high watermark. Use a sufficiently precise and steadily increasing incremental column. If more rows share one identical incremental value than fit in a single batch, the exclusive next cursor can skip the remaining rows with that same value.
 
 ### Table examples
 

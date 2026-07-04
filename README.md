@@ -12,12 +12,13 @@ python migration_sync.py --config config.yaml
 Separate mode templates are included:
 
 ```bash
-python migration_sync.py --config config_incremental_load.yaml
-python migration_sync.py --config config_full_load.yaml
+python migration_incremental_sync.py
+python migration_full_sync.py
 ```
 
-- `config_incremental_load.yaml` writes `migration_incremental_load_checkpoint.json`.
-- `config_full_load.yaml` writes `migration_full_load_checkpoint.json`.
+- `migration_incremental_sync.py` defaults to `config_incremental_load.yaml`, writes `migration_incremental_sync.log`, and uses `migration_incremental_load_checkpoint.json`.
+- `migration_full_sync.py` defaults to `config_full_load.yaml`, writes `migration_full_sync.log`, and uses `migration_full_load_checkpoint.json`.
+- Both scripts accept `--config` to override their default YAML file.
 - Checkpoint JSON files are created at runtime and should not be committed.
 - Both templates use the same advisory lock key, preventing full and incremental jobs from running concurrently against the same target.
 

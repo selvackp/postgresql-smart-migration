@@ -1394,32 +1394,6 @@ def set_table_triggers(target_conn, schema_name, table_name, action):
     target_conn.commit()
 
 
-def truncate_target_for_initial_full_load(target_conn, target_schema, target_table):
-    partition_query = """
-        SELECT COUNT(*)
-        FROM pg_inherits inheritance
-        JOIN pg_class parent ON parent.oid = inheritance.inhparent
-        JOIN pg_namespace parent_schema ON parent_schema.oid = parent.relnamespace
-        WHERE parent_schema.nspname = %s
-          AND parent.relname = %s
-    """
-    with target_conn.cursor() as cur:
-        cur.execute(partition_query, (target_schema, target_table))
-        partition_count = int(cur.fetchone()[0])
-        cur.execute(
-            sql.SQL("TRUNCATE TABLE {schema}.{table} RESTART IDENTITY").format(
-                schema=sql.Identifier(target_schema),
-                table=sql.Identifier(target_table),
-            )
-        )
-    target_conn.commit()
-    logging.warning(
-        f"[{target_table}] Initial full-load target truncated with RESTART IDENTITY; "
-        f"child partitions included={partition_count}"
-    )
-    return partition_count
-
-
 def get_user_trigger_states(target_conn, schema_name, table_name):
     query = """
         SELECT t.tgname, t.tgenabled
@@ -1530,7 +1504,6 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
     else:
         min_value = max_value = None
     table_checkpoint = checkpoint_data.get(table_key)
-    had_table_checkpoint = table_checkpoint is not None
 
     if table_checkpoint and checkpoint_matches_business_key(table_checkpoint, business_key_columns):
         status = table_checkpoint.get("status")
@@ -1577,27 +1550,6 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
             high_watermark = None
 
         logging.info(f"[{target_table}] Start load_type={load_type}, last_incremental={last_incremental_value}, high_watermark={high_watermark}")
-    truncate_initial_target = table_cfg.get(
-        "truncate_target_before_full_load",
-        m.get("truncate_target_before_full_load", False),
-    )
-    if load_type == "full" and truncate_initial_target:
-        if had_table_checkpoint:
-            logging.info(
-                f"[{target_table}] Initial target truncate skipped because a table checkpoint already exists"
-            )
-        else:
-            truncate_target_for_initial_full_load(target_conn, target_schema, target_table)
-            checkpoint_data[table_key] = {
-                "last_incremental_value": None,
-                "last_key_values": serialize_key_values(last_key_values),
-                "high_watermark": None,
-                "total_rows": 0,
-                "status": "TRUNCATED",
-                "load_type": load_type,
-                "business_key_columns": business_key_columns,
-            }
-            write_checkpoint(m["checkpoint_file"], checkpoint_data)
     stats["source_rows"] = count_source_rows_for_run(
         source_conn,
         source_schema,

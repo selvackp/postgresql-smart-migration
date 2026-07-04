@@ -41,6 +41,25 @@ class RowDatabaseError(Exception):
 
 
 class MigrationSafetyTests(unittest.TestCase):
+    def test_table_issue_is_logged_with_structured_scope_and_status(self):
+        table_cfg = {
+            "source_table": "source_table",
+            "target_table": "target_table",
+            "load_type": "incremental",
+            "enabled": True,
+        }
+        with mock.patch.object(migration, "log_bad_rows") as log_bad_rows:
+            migration.log_table_issue(
+                object(), "public", "migration_error_log", table_cfg,
+                "SKIPPED", "validation failed"
+            )
+        args = log_bad_rows.call_args.args
+        record = args[4][0]
+        self.assertIsNone(record["business_key"])
+        self.assertEqual(record["error_message"], "validation failed")
+        self.assertEqual(record["row_data"]["issue_scope"], "table")
+        self.assertEqual(record["row_data"]["status"], "SKIPPED")
+
     def test_incremental_insert_only_mode_requires_all_opt_in_settings(self):
         enabled = {
             "load_type": "incremental",

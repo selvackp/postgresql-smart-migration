@@ -354,6 +354,14 @@ def is_type_compatible(source_meta, target_meta):
         ("integer", "decimal"),
         ("bigint", "numeric"),
         ("bigint", "decimal"),
+        ("numeric", "integer"),
+        ("numeric", "bigint"),
+        ("numeric", "smallint"),
+        ("decimal", "integer"),
+        ("decimal", "bigint"),
+        ("decimal", "smallint"),
+        ("bigint", "integer"),
+        ("bigint", "smallint"),
         ("real", "double precision"),
         ("real", "numeric"),
         ("real", "decimal"),
@@ -367,6 +375,8 @@ def is_type_compatible(source_meta, target_meta):
         ("date", "timestamp without time zone"),
         ("date", "timestamp with time zone"),
         ("timestamp without time zone", "timestamp with time zone"),
+        ("timestamp without time zone", "date"),
+        ("timestamp with time zone", "date"),
     }
     if (source_type, target_type) in compatible_pairs:
         return True, True

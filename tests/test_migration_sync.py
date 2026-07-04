@@ -200,6 +200,20 @@ class MigrationSafetyTests(unittest.TestCase):
         )
         self.assertEqual(compatible, (True, True))
 
+    def test_numeric_to_integer_is_compatible(self):
+        compatible = migration.is_type_compatible(
+            {"data_type": "numeric", "udt_name": "numeric"},
+            {"data_type": "integer", "udt_name": "int4"},
+        )
+        self.assertEqual(compatible, (True, True))
+
+    def test_timestamp_with_timezone_to_date_is_compatible(self):
+        compatible = migration.is_type_compatible(
+            {"data_type": "timestamp with time zone", "udt_name": "timestamptz"},
+            {"data_type": "date", "udt_name": "date"},
+        )
+        self.assertEqual(compatible, (True, True))
+
     def test_varchar_to_fixed_character_is_compatible(self):
         compatible = migration.is_type_compatible(
             {"data_type": "character varying", "udt_name": "varchar"},

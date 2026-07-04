@@ -1807,7 +1807,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
         last_incremental_seen_count,
     )
     triggers_disabled = False
-    lock_key = int(m.get("advisory_lock_key", 123456789))
+    lock_key = int(m.get("advisory_lock_key", 987654321))
     try:
         disable_triggers = table_cfg.get(
             "disable_triggers_during_load",
@@ -2216,7 +2216,7 @@ def main():
         target_conn.commit()
 
         # Prevent overlapping scheduled runs.
-        lock_key = int(cfg["migration"].get("advisory_lock_key", 123456789))
+        lock_key = int(cfg["migration"].get("advisory_lock_key", 987654321))
         if cfg["migration"].get("use_advisory_lock", True):
             lock_acquired = acquire_advisory_lock(target_conn, lock_key)
             if not lock_acquired:
@@ -2353,7 +2353,7 @@ def main():
         if target_conn and lock_acquired:
             release_advisory_lock(
                 target_conn,
-                int(cfg["migration"].get("advisory_lock_key", 123456789))
+                int(cfg["migration"].get("advisory_lock_key", 987654321))
             )
 
         if source_conn:

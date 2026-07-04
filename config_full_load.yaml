@@ -36,7 +36,7 @@ migration:
   skip_bad_rows: true
   fail_on_error_log_failure: false
   use_advisory_lock: true
-  advisory_lock_key: 987654321
+  advisory_lock_key: 123456789
   allow_incremental_without_target_unique_index: false
   reset_sequences: true
   check_disabled_triggers_after_run: true

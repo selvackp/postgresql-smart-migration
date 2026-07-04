@@ -20,7 +20,7 @@ python migration_full_sync.py
 - `migration_full_sync.py` defaults to `config_full_load.yaml`, writes `migration_full_sync.log`, and uses `migration_full_load_checkpoint.json`.
 - Both scripts accept `--config` to override their default YAML file.
 - Checkpoint JSON files are created at runtime and should not be committed.
-- Both templates use the same advisory lock key, preventing full and incremental jobs from running concurrently against the same target.
+- The incremental template uses advisory lock `987654321`; the full template uses `123456789`. Separate keys allow the two runners to execute concurrently, so do not configure overlapping target tables in simultaneous runs.
 
 ## What it does
 

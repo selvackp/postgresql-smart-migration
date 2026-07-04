@@ -87,6 +87,15 @@ def get_load_type(cfg, table_cfg):
     return table_cfg.get("load_type", cfg["migration"].get("default_load_type", "incremental")).lower()
 
 
+def is_incremental_insert_only_duplicate_mode(table_cfg, load_type=None):
+    load_type = load_type or str(table_cfg.get("load_type", "")).lower()
+    return (
+        load_type == "incremental"
+        and table_cfg.get("insert_only") is True
+        and table_cfg.get("allow_duplicates") is True
+    )
+
+
 def parse_value(value):
     if value in (None, "", "None", "null", "NULL"):
         return None
@@ -610,17 +619,22 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
     if incremental_column and incremental_column in generated_always_columns:
         raise PreMigrationValidationError(f"[{target_table}] incremental_column {incremental_column} is a target GENERATED ALWAYS identity column and cannot be loaded")
     configured_business_key = bool(table_cfg.get("business_key_columns"))
-    try:
-        business_key_columns = detect_business_key(source_conn, target_conn, cfg, table_cfg)
-    except Exception as e:
-        if load_type == "full":
-            logging.warning(
-                f"[{target_table}] No business key/PK/unique key found. "
-                "Proceeding with full load using insert-only mode."
-            )
-            business_key_columns = []
-        else:
-            raise PreMigrationValidationError(str(e))
+    incremental_insert_only = is_incremental_insert_only_duplicate_mode(table_cfg, load_type)
+    if incremental_insert_only:
+        business_key_columns = []
+        logging.info(f"[{target_table}] Incremental insert-only duplicate mode enabled")
+    else:
+        try:
+            business_key_columns = detect_business_key(source_conn, target_conn, cfg, table_cfg)
+        except Exception as e:
+            if load_type == "full":
+                logging.warning(
+                    f"[{target_table}] No business key/PK/unique key found. "
+                    "Proceeding with full load using insert-only mode."
+                )
+                business_key_columns = []
+            else:
+                raise PreMigrationValidationError(str(e))
 
     generated_identity_key_columns = [c for c in business_key_columns if c in generated_always_columns]
     if generated_identity_key_columns:
@@ -640,22 +654,23 @@ def prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type):
             raise PreMigrationValidationError(
                 f"[{target_table}] Business key {key_col} not found in source and target"
             )
-    validate_business_key_safety(
-        source_conn,
-        target_conn,
-        source_schema,
-        target_schema,
-        source_table,
-        target_table,
-        source_meta,
-        target_meta,
-        business_key_columns,
-        load_type,
-        table_cfg.get(
-            "allow_incremental_without_target_unique_index",
-            cfg["migration"].get("allow_incremental_without_target_unique_index", False),
-        ),
-    )
+    if not incremental_insert_only:
+        validate_business_key_safety(
+            source_conn,
+            target_conn,
+            source_schema,
+            target_schema,
+            source_table,
+            target_table,
+            source_meta,
+            target_meta,
+            business_key_columns,
+            load_type,
+            table_cfg.get(
+                "allow_incremental_without_target_unique_index",
+                cfg["migration"].get("allow_incremental_without_target_unique_index", False),
+            ),
+        )
     partition_column = table_cfg.get("partition_column")
     if partition_column and partition_column not in source_columns: raise PreMigrationValidationError(f"[{target_table}] Partition column {partition_column} not found in source and target")
     if partition_column and partition_column in generated_always_columns:
@@ -1059,6 +1074,27 @@ def fetch_incremental_batch(source_conn, source_schema, source_table, columns, i
         return cur.fetchall()
 
 
+def fetch_incremental_insert_only_batch(
+    source_conn, source_schema, source_table, columns, incremental_column,
+    last_incremental_value, high_watermark, batch_size
+):
+    select_cols = sql.SQL(", ").join(sql.Identifier(c) for c in columns)
+    query = sql.SQL("""
+        SELECT {select_cols} FROM {schema}.{table}
+        WHERE {inc} > %s AND {inc} <= %s
+        ORDER BY {inc}
+        LIMIT %s
+    """).format(
+        select_cols=select_cols,
+        schema=sql.Identifier(source_schema),
+        table=sql.Identifier(source_table),
+        inc=sql.Identifier(incremental_column),
+    )
+    with source_conn.cursor() as cur:
+        cur.execute(query, (last_incremental_value, high_watermark, batch_size))
+        return cur.fetchall()
+
+
 def fetch_full_batch(source_conn, source_schema, source_table, columns, business_key_columns, last_key_values, batch_size):
     select_cols = sql.SQL(", ").join(sql.Identifier(c) for c in columns)
     order_sql = sql.SQL(", ").join(sql.Identifier(c) for c in business_key_columns)
@@ -1127,6 +1163,7 @@ def count_source_rows_for_run(
     last_key_values,
     high_watermark,
     offset_rows,
+    incremental_insert_only=False,
 ):
     if load_type == "full" and not business_key_columns:
         return max(get_table_row_count(source_conn, source_schema, source_table) - offset_rows, 0)
@@ -1142,6 +1179,16 @@ def count_source_rows_for_run(
             values=placeholders,
         )
         params = list(last_key_values)
+    elif incremental_insert_only:
+        query = sql.SQL("""
+            SELECT COUNT(*) FROM {schema}.{table}
+            WHERE {incremental} > %s AND {incremental} <= %s
+        """).format(
+            schema=sql.Identifier(source_schema),
+            table=sql.Identifier(source_table),
+            incremental=sql.Identifier(incremental_column),
+        )
+        params = [last_incremental_value, high_watermark]
     elif last_incremental_value is None:
         query = sql.SQL("""
             SELECT COUNT(*) FROM {schema}.{table}
@@ -1283,6 +1330,23 @@ def insert_from_temp_only(target_conn, target_schema, target_table, temp_table, 
     return 0, inserted_rows
 
 
+def insert_from_temp_allow_duplicates(target_conn, target_schema, target_table, temp_table, columns):
+    insert_cols = sql.SQL(", ").join(sql.Identifier(c) for c in columns)
+    insert_sql = sql.SQL("""
+        INSERT INTO {schema}.{target_table} ({insert_cols})
+        SELECT {insert_cols}
+        FROM {temp_table};
+    """).format(
+        schema=sql.Identifier(target_schema),
+        target_table=sql.Identifier(target_table),
+        temp_table=sql.Identifier(temp_table),
+        insert_cols=insert_cols,
+    )
+    with target_conn.cursor() as cur:
+        cur.execute(insert_sql)
+        return 0, cur.rowcount
+
+
 def is_row_level_database_error(error):
     sqlstate = getattr(error, "pgcode", None)
     return bool(sqlstate and sqlstate[:2] in ("22", "23"))
@@ -1309,6 +1373,7 @@ def load_rows_with_isolation(
     load_type,
     rows,
     depth=0,
+    incremental_insert_only=False,
 ):
     if not rows:
         return {"inserted": 0, "updated": 0, "conflict_skipped": 0}, [], []
@@ -1319,7 +1384,11 @@ def load_rows_with_isolation(
     try:
         truncate_temp(target_conn, temp_table)
         copy_to_temp(target_conn, temp_table, columns, rows)
-        if load_type == "full" and not business_key_columns:
+        if incremental_insert_only:
+            updated_rows, inserted_rows = insert_from_temp_allow_duplicates(
+                target_conn, target_schema, target_table, temp_table, columns
+            )
+        elif load_type == "full" and not business_key_columns:
             updated_rows, inserted_rows = insert_from_temp_only(
                 target_conn, target_schema, target_table, temp_table, columns
             )
@@ -1374,11 +1443,13 @@ def load_rows_with_isolation(
             midpoint = len(rows) // 2
             left = load_rows_with_isolation(
                 target_conn, target_schema, target_table, temp_table, columns,
-                business_key_columns, incremental_column, load_type, rows[:midpoint], depth + 1
+                business_key_columns, incremental_column, load_type, rows[:midpoint], depth + 1,
+                incremental_insert_only
             )
             right = load_rows_with_isolation(
                 target_conn, target_schema, target_table, temp_table, columns,
-                business_key_columns, incremental_column, load_type, rows[midpoint:], depth + 1
+                business_key_columns, incremental_column, load_type, rows[midpoint:], depth + 1,
+                incremental_insert_only
             )
             stats = {
                 key: left[0][key] + right[0][key]
@@ -1492,6 +1563,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
     load_type = get_load_type(cfg, table_cfg)
     if load_type == "skip": logging.info(f"[{target_table}] Skipped"); return
     if load_type not in ("full", "incremental"): raise Exception(f"[{target_table}] Invalid load_type: {load_type}")
+    incremental_insert_only = is_incremental_insert_only_duplicate_mode(table_cfg, load_type)
     stats = new_reconciliation_stats(target_table, load_type)
     table_key, temp_table = f"{source_schema}.{source_table}_to_{target_schema}.{target_table}", f"tmp_migration_{target_table}"
     source_columns, target_columns, source_meta, target_meta, business_key_columns = prepare_metadata(source_conn, target_conn, cfg, table_cfg, load_type)
@@ -1505,7 +1577,12 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
         min_value = max_value = None
     table_checkpoint = checkpoint_data.get(table_key)
 
-    if table_checkpoint and checkpoint_matches_business_key(table_checkpoint, business_key_columns):
+    if incremental_insert_only and table_checkpoint and "last_incremental_value" in table_checkpoint:
+        last_incremental_value = parse_value(table_checkpoint.get("last_incremental_value"))
+        last_key_values = []
+        high_watermark = max_value
+        total_rows = 0
+    elif table_checkpoint and checkpoint_matches_business_key(table_checkpoint, business_key_columns):
         status = table_checkpoint.get("status")
 
         if load_type == "full" and status == "COMPLETED":
@@ -1543,7 +1620,15 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
         total_rows = 0
 
         if load_type == "incremental":
-            last_incremental_value = None
+            if incremental_insert_only:
+                configured_initial = table_cfg.get("initial_incremental_value")
+                last_incremental_value = (
+                    parse_value(configured_initial)
+                    if configured_initial is not None
+                    else get_initial_incremental_value(min_value)
+                )
+            else:
+                last_incremental_value = None
             high_watermark = max_value
         else:
             last_incremental_value = None
@@ -1561,6 +1646,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
         last_key_values,
         high_watermark,
         total_rows,
+        incremental_insert_only,
     )
     triggers_disabled = False
     lock_key = int(m.get("advisory_lock_key", 987654321))
@@ -1600,6 +1686,17 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                             last_key_values,
                             m["batch_size"]
                         )
+                    elif incremental_insert_only:
+                        rows = fetch_incremental_insert_only_batch(
+                            source_conn,
+                            source_schema,
+                            source_table,
+                            source_columns,
+                            incremental_column,
+                            last_incremental_value,
+                            high_watermark,
+                            m["batch_size"],
+                        )
                     else:
                         rows = fetch_incremental_batch(
                             source_conn,
@@ -1615,15 +1712,20 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         )
                     if not rows:
                         final_status = "WAITING_FOR_NEXT_RUN" if load_type == "incremental" else "COMPLETED"
-                        checkpoint_data[table_key] = {
-                            "last_incremental_value": str(last_incremental_value) if last_incremental_value is not None else None,
-                            "last_key_values": serialize_key_values(last_key_values),
-                            "high_watermark": str(high_watermark) if high_watermark is not None else None,
-                            "total_rows": total_rows,
-                            "status": final_status,
-                            "load_type": load_type,
-                            "business_key_columns": business_key_columns,
-                        }
+                        if incremental_insert_only:
+                            checkpoint_data[table_key] = {
+                                "last_incremental_value": str(last_incremental_value)
+                            }
+                        else:
+                            checkpoint_data[table_key] = {
+                                "last_incremental_value": str(last_incremental_value) if last_incremental_value is not None else None,
+                                "last_key_values": serialize_key_values(last_key_values),
+                                "high_watermark": str(high_watermark) if high_watermark is not None else None,
+                                "total_rows": total_rows,
+                                "status": final_status,
+                                "load_type": load_type,
+                                "business_key_columns": business_key_columns,
+                            }
                         write_checkpoint(m["checkpoint_file"], checkpoint_data)
                         stats["status"] = final_status
                         logging.info(f"[{target_table}] No rows found. Status={final_status}")
@@ -1644,6 +1746,7 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                             incremental_column,
                             load_type,
                             good_rows,
+                            incremental_insert_only=incremental_insert_only,
                         )
                         target_conn.commit()
                     rows_to_log = bad_rows + database_bad_rows + conflict_rows
@@ -1672,15 +1775,20 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         else last_incremental_value
                     )
                     next_total_rows = total_rows + len(rows)
-                    checkpoint_data[table_key] = {
-                        "last_incremental_value": str(next_incremental_value) if next_incremental_value is not None else None,
-                        "last_key_values": serialize_key_values(next_key_values),
-                        "high_watermark": str(high_watermark) if high_watermark is not None else None,
-                        "total_rows": next_total_rows,
-                        "status": "RUNNING",
-                        "load_type": load_type,
-                        "business_key_columns": business_key_columns,
-                    }
+                    if incremental_insert_only:
+                        checkpoint_data[table_key] = {
+                            "last_incremental_value": str(next_incremental_value)
+                        }
+                    else:
+                        checkpoint_data[table_key] = {
+                            "last_incremental_value": str(next_incremental_value) if next_incremental_value is not None else None,
+                            "last_key_values": serialize_key_values(next_key_values),
+                            "high_watermark": str(high_watermark) if high_watermark is not None else None,
+                            "total_rows": next_total_rows,
+                            "status": "RUNNING",
+                            "load_type": load_type,
+                            "business_key_columns": business_key_columns,
+                        }
                     write_checkpoint(m["checkpoint_file"], checkpoint_data)
                     last_key_values = next_key_values
                     last_incremental_value = next_incremental_value
@@ -1701,7 +1809,12 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                     logging.exception(f"[{target_table}] Retry {retry_count}/{m['max_retries']} failed: {e}")
                     time.sleep(10)
                     if retry_count == m["max_retries"]:
-                        checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value) if last_incremental_value is not None else None, "last_key_values": serialize_key_values(last_key_values), "high_watermark": str(high_watermark) if high_watermark is not None else None, "total_rows": total_rows, "status": "FAILED", "load_type": load_type, "business_key_columns": business_key_columns, "error": str(e)}
+                        if incremental_insert_only:
+                            checkpoint_data[table_key] = {
+                                "last_incremental_value": str(last_incremental_value)
+                            }
+                        else:
+                            checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value) if last_incremental_value is not None else None, "last_key_values": serialize_key_values(last_key_values), "high_watermark": str(high_watermark) if high_watermark is not None else None, "total_rows": total_rows, "status": "FAILED", "load_type": load_type, "business_key_columns": business_key_columns, "error": str(e)}
                         write_checkpoint(m["checkpoint_file"], checkpoint_data); raise e
             time.sleep(m["sleep_seconds"])
     finally:

@@ -2,4 +2,5 @@ __pycache__/
 *.py[cod]
 migration_sync.log
 migration_checkpoint.json
+migration_*_checkpoint.json
 *.tmp

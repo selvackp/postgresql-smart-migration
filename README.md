@@ -9,6 +9,18 @@ pip install -r requirements.txt
 python migration_sync.py --config config.yaml
 ```
 
+Separate mode templates are included:
+
+```bash
+python migration_sync.py --config config_incremental_load.yaml
+python migration_sync.py --config config_full_load.yaml
+```
+
+- `config_incremental_load.yaml` writes `migration_incremental_load_checkpoint.json`.
+- `config_full_load.yaml` writes `migration_full_load_checkpoint.json`.
+- Checkpoint JSON files are created at runtime and should not be committed.
+- Both templates use the same advisory lock key, preventing full and incremental jobs from running concurrently against the same target.
+
 ## What it does
 
 - Runs full and incremental table loads.
@@ -107,6 +119,9 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `load_type` | Global default | `full` scans all source rows once; `incremental` uses a high-watermark column. Incremental requires a business/PK/unique key. Full load merges by key when one exists, or uses insert-only mode when no key exists. Full load does not truncate the target. |
 | `incremental_column` | Incremental only | Source/target column used for high-watermark ordering, such as `updated_at` or `crtdate`. NULL values are not selected. |
 | `business_key_columns` | Auto-detected | Stable, non-NULL data columns used for keyset pagination, updates, inserts, and resume. Detection order is target PK, source PK, target unique key, source unique key. Incremental loads require a matching non-partial target unique index; full loads only warn when it is absent. When the source lacks one, the script scans current source data for NULL and duplicate keys before loading. Required for incremental, optional for full load. |
+| `insert_only` | `false` | With `load_type: incremental` and `allow_duplicates: true`, enables table-level cursor-only inserts without UPSERT. |
+| `allow_duplicates` | `false` | Completes the explicit opt-in for incremental insert-only duplicate mode. No business-key uniqueness or target unique-index validation is performed. |
+| `initial_incremental_value` | Source minimum fallback | Starting exclusive incremental value used only when this mode has no checkpoint. |
 | `allow_incremental_without_target_unique_index` | Global setting | Optional per-table opt-in for legacy targets that cannot add a unique index. Current target keys are checked for duplicates before loading. |
 | `partition_column` | `null` | Target partition key. Use `null` for a non-partitioned target. The column must exist in source and target. |
 | `partition_type` | `null` | `range`, `list`, or `null`. Must match the target parent's PostgreSQL partition strategy. |
@@ -134,6 +149,28 @@ For a legacy incremental target that cannot add a unique index, opt in explicitl
 ```
 
 The script verifies that current target `id` values are not duplicated before loading. Keep application writes controlled during migration because the database still cannot enforce uniqueness.
+
+For an append-only incremental table where duplicate business keys are intentional:
+
+```yaml
+- source_table: profactcustthreatprofile1
+  target_table: profactcustthreatprofile1
+  load_type: incremental
+  incremental_column: crtdate
+  partition_column: null
+  partition_type: null
+  business_key_columns:
+    - custid
+    - ruleid
+    - crtdate
+  insert_only: true
+  allow_duplicates: true
+  initial_incremental_value: "2026-07-04 00:00:00"
+  column_defaults: {}
+  enabled: true
+```
+
+This mode reads only `incremental_column > last_incremental_value` through the captured high watermark, inserts without updates or `ON CONFLICT`, and checkpoints only `last_incremental_value`. PostgreSQL constraints still apply; rejected rows are isolated and logged. Because the cursor is exclusive and has no key tie-breaker, use an incremental column granular enough that one value cannot span a batch boundary.
 
 ### Table examples
 

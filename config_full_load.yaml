@@ -1,0 +1,54 @@
+source:
+  host: ""
+  port: 5432
+  database: ""
+  user: ""
+  password: ""
+  schema: "public"
+
+target:
+  host: ""
+  port: 5432
+  database: ""
+  user: ""
+  password: ""
+  schema: "public"
+
+migration:
+  batch_size: 20000
+  sleep_seconds: 2
+  max_retries: 1
+  checkpoint_file: "migration_full_load_checkpoint.json"
+  error_table: "migration_error_log"
+  timezone: "Asia/Kolkata"
+  default_load_type: "full"
+  stop_on_table_error: false
+  create_missing_partitions: true
+  disable_triggers_globally: true
+  partition_granularity: "daily"
+  range_partition_name_format: "{table}_p{yyyymmdd}"
+  list_partition_name_format: "{table}_p{value}"
+  create_default_partition: false
+  default_partition_name_format: "{table}_default"
+  validate_lengths: true
+  validate_not_null: true
+  truncate_long_strings: false
+  skip_bad_rows: true
+  fail_on_error_log_failure: false
+  use_advisory_lock: true
+  advisory_lock_key: 987654321
+  allow_incremental_without_target_unique_index: false
+  reset_sequences: true
+  check_disabled_triggers_after_run: true
+
+  tables:
+    - source_table: dummy_full_table
+      target_table: dummy_full_table
+      load_type: full
+      incremental_column: null
+      partition_column: null
+      partition_type: null
+      business_key_columns:
+        - id
+      column_defaults: {}
+      enabled: true

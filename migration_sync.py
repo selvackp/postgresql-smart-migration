@@ -1664,31 +1664,19 @@ def load_rows_with_isolation(
             raise RuntimeError(
                 f"[{target_table}] Database affected more rows than supplied; verify business-key uniqueness"
             )
-        if conflict_rows and len(rows) > 1:
-            raise ConflictRowsDetected()
         with target_conn.cursor() as cur:
             cur.execute(sql.SQL("RELEASE SAVEPOINT {}").format(savepoint))
-        conflicts = []
-        if conflict_rows:
-            conflicts.append(row_error_record(
-                rows[0],
-                columns,
-                business_key_columns,
-                "Row skipped by ON CONFLICT DO NOTHING",
-            ))
         return {
             "inserted": inserted_rows,
             "updated": updated_rows,
             "conflict_skipped": conflict_rows,
-        }, [], conflicts
+        }, [], []
     except Exception as error:
         with target_conn.cursor() as cur:
             cur.execute(sql.SQL("ROLLBACK TO SAVEPOINT {}").format(savepoint))
             cur.execute(sql.SQL("RELEASE SAVEPOINT {}").format(savepoint))
-        if isinstance(error, ConflictRowsDetected) or is_row_level_database_error(error):
+        if is_row_level_database_error(error):
             if len(rows) == 1:
-                if isinstance(error, ConflictRowsDetected):
-                    raise RuntimeError("Conflict isolation reached an unexpected leaf state")
                 bad_row = row_error_record(
                     rows[0],
                     columns,

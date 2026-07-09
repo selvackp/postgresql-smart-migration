@@ -426,7 +426,7 @@ class MigrationSafetyTests(unittest.TestCase):
         self.assertEqual(result, [(1,)])
         self.assertEqual(connection.executions[-1][1], ["2026-01-01T00:00:00", 100])
 
-    def test_conflicts_are_isolated_and_counted(self):
+    def test_conflicts_are_counted_without_row_isolation(self):
         connection = FakeConnection()
         current_rows = {}
 
@@ -450,7 +450,7 @@ class MigrationSafetyTests(unittest.TestCase):
 
         self.assertEqual(stats, {"inserted": 0, "updated": 0, "conflict_skipped": 2})
         self.assertEqual(bad_rows, [])
-        self.assertEqual([row["business_key"] for row in conflict_rows], ["1", "2"])
+        self.assertEqual(conflict_rows, [])
 
     def test_database_row_error_isolated_without_losing_good_rows(self):
         connection = FakeConnection()

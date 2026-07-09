@@ -562,6 +562,86 @@ def create_trigger_state_table(target_conn, target_schema):
     target_conn.commit()
 
 
+def create_duplicate_checkpoint_table(target_conn, target_schema):
+    query = sql.SQL("""
+        CREATE TABLE IF NOT EXISTS {schema}.migration_duplicate_checkpoint (
+            table_key text PRIMARY KEY,
+            last_incremental_value text,
+            last_incremental_seen_count bigint NOT NULL DEFAULT 0,
+            high_watermark text,
+            total_rows bigint NOT NULL DEFAULT 0,
+            status text,
+            updated_at timestamptz NOT NULL DEFAULT now()
+        )
+    """).format(schema=sql.Identifier(target_schema))
+    with target_conn.cursor() as cur:
+        cur.execute(query)
+    target_conn.commit()
+
+
+def read_duplicate_checkpoint(target_conn, target_schema, table_key):
+    query = sql.SQL("""
+        SELECT last_incremental_value,
+               last_incremental_seen_count,
+               high_watermark,
+               total_rows,
+               status
+        FROM {schema}.migration_duplicate_checkpoint
+        WHERE table_key = %s
+    """).format(schema=sql.Identifier(target_schema))
+    with target_conn.cursor() as cur:
+        cur.execute(query, (table_key,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "last_incremental_value": row[0],
+        "last_incremental_seen_count": int(row[1] or 0),
+        "high_watermark": row[2],
+        "total_rows": int(row[3] or 0),
+        "status": row[4],
+        "last_key_values": [],
+        "business_key_columns": [],
+        "load_type": "incremental",
+    }
+
+
+def write_duplicate_checkpoint_cursor(
+    cur,
+    target_schema,
+    table_key,
+    last_incremental_value,
+    last_incremental_seen_count,
+    high_watermark,
+    total_rows,
+    status,
+):
+    query = sql.SQL("""
+        INSERT INTO {schema}.migration_duplicate_checkpoint
+            (table_key, last_incremental_value, last_incremental_seen_count, high_watermark, total_rows, status)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (table_key)
+        DO UPDATE SET
+            last_incremental_value = EXCLUDED.last_incremental_value,
+            last_incremental_seen_count = EXCLUDED.last_incremental_seen_count,
+            high_watermark = EXCLUDED.high_watermark,
+            total_rows = EXCLUDED.total_rows,
+            status = EXCLUDED.status,
+            updated_at = now()
+    """).format(schema=sql.Identifier(target_schema))
+    cur.execute(
+        query,
+        (
+            table_key,
+            str(last_incremental_value) if last_incremental_value is not None else None,
+            int(last_incremental_seen_count or 0),
+            str(high_watermark) if high_watermark is not None else None,
+            int(total_rows or 0),
+            status,
+        ),
+    )
+
+
 def json_safe_value(value):
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -1596,11 +1676,13 @@ def load_rows_with_isolation(
             midpoint = len(rows) // 2
             left = load_rows_with_isolation(
                 target_conn, target_schema, target_table, temp_table, columns,
-                business_key_columns, incremental_column, load_type, rows[:midpoint], depth + 1
+                business_key_columns, incremental_column, load_type, rows[:midpoint], depth + 1,
+                is_insert_only_mode
             )
             right = load_rows_with_isolation(
                 target_conn, target_schema, target_table, temp_table, columns,
-                business_key_columns, incremental_column, load_type, rows[midpoint:], depth + 1
+                business_key_columns, incremental_column, load_type, rows[midpoint:], depth + 1,
+                is_insert_only_mode
             )
             stats = {
                 key: left[0][key] + right[0][key]
@@ -1738,6 +1820,11 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
     else:
         min_value = max_value = None
     table_checkpoint = checkpoint_data.get(table_key)
+    if insert_only_incremental:
+        db_checkpoint = read_duplicate_checkpoint(target_conn, target_schema, table_key)
+        if db_checkpoint:
+            table_checkpoint = db_checkpoint
+            logging.info(f"[{target_table}] Loaded duplicate insert-only checkpoint from target database")
 
     if table_checkpoint and (insert_only_incremental or checkpoint_matches_business_key(table_checkpoint, business_key_columns)):
         status = table_checkpoint.get("status")
@@ -1871,6 +1958,19 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         )
                     if not rows:
                         final_status = "WAITING_FOR_NEXT_RUN" if load_type == "incremental" else "COMPLETED"
+                        if insert_only_incremental:
+                            with target_conn.cursor() as cur:
+                                write_duplicate_checkpoint_cursor(
+                                    cur,
+                                    target_schema,
+                                    table_key,
+                                    last_incremental_value,
+                                    last_incremental_seen_count,
+                                    high_watermark,
+                                    total_rows,
+                                    final_status,
+                                )
+                            target_conn.commit()
                         checkpoint_data[table_key] = {
                             "last_incremental_value": str(last_incremental_value) if last_incremental_value is not None else None,
                             "last_key_values": serialize_key_values(last_key_values),
@@ -1903,9 +2003,10 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                             good_rows,
                             is_insert_only_mode=insert_only_incremental,
                         )
-                        target_conn.commit()
+                        if not insert_only_incremental:
+                            target_conn.commit()
                     rows_to_log = bad_rows + database_bad_rows + conflict_rows
-                    if rows_to_log:
+                    if rows_to_log and not insert_only_incremental:
                         for bad_row in rows_to_log:
                             logging.error(
                                 f"[{target_table}] Bad row: key={bad_row['business_key']}, "
@@ -1944,6 +2045,19 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         next_incremental_seen_count = 0
 
                     next_total_rows = total_rows + len(rows)
+                    if insert_only_incremental:
+                        with target_conn.cursor() as cur:
+                            write_duplicate_checkpoint_cursor(
+                                cur,
+                                target_schema,
+                                table_key,
+                                next_incremental_value,
+                                next_incremental_seen_count,
+                                high_watermark,
+                                next_total_rows,
+                                "RUNNING",
+                            )
+                        target_conn.commit()
                     checkpoint_data[table_key] = {
                         "last_incremental_value": str(next_incremental_value) if next_incremental_value is not None else None,
                         "last_key_values": serialize_key_values(next_key_values),
@@ -1955,6 +2069,21 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                         "business_key_columns": business_key_columns,
                     }
                     write_checkpoint(m["checkpoint_file"], checkpoint_data)
+                    if rows_to_log and insert_only_incremental:
+                        for bad_row in rows_to_log:
+                            logging.error(
+                                f"[{target_table}] Bad row: key={bad_row['business_key']}, "
+                                f"error={bad_row['error_message']}"
+                            )
+                        log_bad_rows(
+                            target_conn,
+                            target_schema,
+                            m["error_table"],
+                            target_table,
+                            rows_to_log,
+                            fail_on_error=m.get("fail_on_error_log_failure", False),
+                        )
+                        logging.warning(f"[{target_table}] Rows logged: {len(rows_to_log)}")
                     last_key_values = next_key_values
                     last_incremental_value = next_incremental_value
                     last_incremental_seen_count = next_incremental_seen_count
@@ -1975,6 +2104,19 @@ def migrate_table(source_conn, target_conn, cfg, table_cfg, checkpoint_data):
                     logging.exception(f"[{target_table}] Retry {retry_count}/{m['max_retries']} failed: {e}")
                     time.sleep(10)
                     if retry_count == m["max_retries"]:
+                        if insert_only_incremental:
+                            with target_conn.cursor() as cur:
+                                write_duplicate_checkpoint_cursor(
+                                    cur,
+                                    target_schema,
+                                    table_key,
+                                    last_incremental_value,
+                                    last_incremental_seen_count,
+                                    high_watermark,
+                                    total_rows,
+                                    "FAILED",
+                                )
+                            target_conn.commit()
                         checkpoint_data[table_key] = {"last_incremental_value": str(last_incremental_value) if last_incremental_value is not None else None, "last_key_values": serialize_key_values(last_key_values), "high_watermark": str(high_watermark) if high_watermark is not None else None, "total_rows": total_rows, "last_incremental_seen_count": last_incremental_seen_count, "status": "FAILED", "load_type": load_type, "business_key_columns": business_key_columns, "error": str(e)}
                         write_checkpoint(m["checkpoint_file"], checkpoint_data); raise e
             time.sleep(m["sleep_seconds"])
@@ -2232,6 +2374,7 @@ def main():
             cfg["migration"]["error_table"]
         )
         create_trigger_state_table(target_conn, cfg["target"]["schema"])
+        create_duplicate_checkpoint_table(target_conn, cfg["target"]["schema"])
         recover_recorded_triggers(target_conn, cfg["target"]["schema"], lock_key)
         bad_row_start = get_bad_row_count(
             target_conn,

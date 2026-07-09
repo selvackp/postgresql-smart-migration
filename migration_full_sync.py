@@ -608,29 +608,6 @@ def log_bad_rows(target_conn, target_schema, error_table, table_name, bad_rows, 
             raise
 
 
-def log_table_issue(target_conn, target_schema, error_table, table_cfg, status, error_message, fail_on_error=False):
-    table_name = table_cfg.get("target_table") or table_cfg.get("source_table") or "unknown"
-    log_bad_rows(
-        target_conn,
-        target_schema,
-        error_table,
-        table_name,
-        [{
-            "business_key": None,
-            "error_message": str(error_message),
-            "row_data": {
-                "issue_scope": "table",
-                "status": status,
-                "source_table": table_cfg.get("source_table"),
-                "target_table": table_cfg.get("target_table"),
-                "load_type": table_cfg.get("load_type"),
-                "enabled": table_cfg.get("enabled", True),
-            },
-        }],
-        fail_on_error=fail_on_error,
-    )
-
-
 def target_has_database_default(meta):
     return meta.get("column_default") is not None or meta.get("is_identity") == "YES"
 
@@ -2270,11 +2247,6 @@ def main():
 
             if load_type == "skip":
                 logging.info(f"[{table_name}] Skipped due to load_type=skip or enabled=false")
-                log_table_issue(
-                    target_conn, cfg["target"]["schema"], cfg["migration"]["error_table"],
-                    table_cfg, "SKIPPED", "load_type=skip or enabled=false",
-                    cfg["migration"].get("fail_on_error_log_failure", False),
-                )
                 skipped_tables.append({
                     "table": table_name,
                     "reason": "load_type=skip or enabled=false"
@@ -2313,11 +2285,6 @@ def main():
             except PreMigrationValidationError as e:
                 target_conn.rollback()
                 logging.error(f"[{table_name}] Pre-migration validation failed: {e}")
-                log_table_issue(
-                    target_conn, cfg["target"]["schema"], cfg["migration"]["error_table"],
-                    table_cfg, "SKIPPED", str(e),
-                    cfg["migration"].get("fail_on_error_log_failure", False),
-                )
                 if cfg["migration"].get("stop_on_table_error", False):
                     raise e
                 skipped_tables.append({
@@ -2328,12 +2295,6 @@ def main():
 
             except Exception as e:
                 target_conn.rollback()
-
-                log_table_issue(
-                    target_conn, cfg["target"]["schema"], cfg["migration"]["error_table"],
-                    table_cfg, "FAILED", str(e),
-                    cfg["migration"].get("fail_on_error_log_failure", False),
-                )
 
                 failed_tables.append({
                     "table": table_name,
@@ -2361,7 +2322,7 @@ def main():
         logging.info(f"Success tables: {len(success_tables)}")
         logging.info(f"Failed tables : {len(failed_tables)}")
         logging.info(f"Skipped tables: {len(skipped_tables)}")
-        logging.info(f"Error records logged: {bad_row_count}")
+        logging.info(f"Bad rows logged: {bad_row_count}")
         logging.info(f"Disabled user triggers: {disabled_trigger_count}")
 
         for item in failed_tables:

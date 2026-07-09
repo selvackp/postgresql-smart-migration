@@ -36,7 +36,7 @@ python migration_full_sync.py
 - Auto-detects a primary key or unique key when `business_key_columns` is not configured.
 - Creates missing range/list partitions when configured.
 - Validates NOT NULL values, string length, JSON/JSONB values, and array literals.
-- Logs bad rows and table-level skipped/failed issues into `migration_error_log`; numeric/decimal values are stored as strings, dates/timestamps as ISO text, UUIDs as strings, and binary values as Base64 text in `row_data` JSON.
+- Logs bad rows into `migration_error_log`; numeric/decimal values are stored as strings, dates/timestamps as ISO text, UUIDs as strings, and binary values as Base64 text in `row_data` JSON.
 - Isolates PostgreSQL data/integrity errors to individual rows and records conflict-skipped rows instead of losing them silently.
 - Creates configured range/list partitions from each fetched batch instead of scanning the full source partition range up front.
 - Records trigger state in `migration_trigger_state` and restores it automatically after an interrupted run.
@@ -296,8 +296,6 @@ column_defaults:
 ```
 
 Pre-migration validation checks table existence, common columns, incremental/business/partition columns, datatype compatibility, and business-key safety. Compatible mappings such as `text` to `varchar(n)`, `varchar` to fixed `character(n)`, `date` to timestamp, and floating-point to `numeric` are allowed with a warning; row-level and PostgreSQL validation still enforce target limits. Target-only columns are skipped when nullable or when the target database has its own default/identity value. Target `GENERATED ALWAYS` identity columns are skipped even when the source has the same column, so PostgreSQL can assign the identity value. A target-only `NOT NULL` column without a database default must be provided in `column_defaults`, otherwise the table is skipped with a clear validation error. Row validation covers target NOT NULL constraints, string lengths, JSON/JSONB, and arrays. PostgreSQL data and integrity errors such as numeric overflow, CHECK, foreign-key, enum, and domain violations are isolated to individual rows. During bulk COPY, empty strings are preserved as empty strings and only Python `None` is written as SQL NULL. Rejected and conflict-skipped row payloads are written to `migration_error_log` using JSON-safe representations. The final summary lists every failed table with its error, every skipped table with its reason, and per-table reconciliation totals.
-
-Table-level issues use `business_key = NULL`. Their `row_data` contains `issue_scope: table`, `status: SKIPPED` or `FAILED`, source/target table names, load type, and enabled state. This includes disabled tables, explicit `load_type: skip`, pre-migration validation failures, and runtime table failures. Error-log insertion remains failure-safe according to `migration.fail_on_error_log_failure`. The final summary reports the combined total as `Error records logged`.
 ## Checkpoints
 
 Checkpoints store:

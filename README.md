@@ -27,7 +27,7 @@ python migration_full_sync.py
 
 - Runs full and incremental table loads.
 - Uses a high-watermark incremental window plus business-key ordering for resumable batches.
-- Uses durable target commits before advancing checkpoints; duplicate insert-only incremental tables store their resume checkpoint in the target database transaction.
+- Uses durable target commits before advancing the external checkpoint.
 - Writes checkpoints atomically to avoid corrupt checkpoint JSON.
 - Uses a PostgreSQL advisory lock to prevent overlapping runs.
 - Can disable and re-enable user triggers per table using `migration.disable_triggers_globally`.
@@ -172,7 +172,7 @@ Use this mode only for selected append-only incremental tables where duplicate b
 
 `initial_incremental_value` is optional. Set it once to the desired starting timestamp; do not update it after each run. When no checkpoint exists and this setting is omitted, the first query reads every non-NULL incremental value through the captured high watermark. When it is configured, rows at that timestamp are included because the initial seen-count is zero.
 
-After every committed batch, this mode checkpoints `last_incremental_value` and `last_incremental_seen_count` in the target table `migration_duplicate_checkpoint` inside the same transaction as the inserted rows. The JSON checkpoint file is still updated for visibility, but restart reads the database checkpoint first for this mode. When a batch ends on the same timestamp as the previous batch, the seen-count increases; when it ends on a newer timestamp, the count resets to the number of rows processed at that new timestamp. These checkpoint values take precedence over `initial_incremental_value` on later runs. The configured initial value is used again only if the table has no database checkpoint and no JSON checkpoint entry.
+After every committed batch, this mode checkpoints `last_incremental_value` and `last_incremental_seen_count`. When a batch ends on the same timestamp as the previous batch, the seen-count increases; when it ends on a newer timestamp, the count resets to the number of rows processed at that new timestamp. These checkpoint values take precedence over `initial_incremental_value` on later runs. The configured initial value is used again only if the table's checkpoint entry or the entire checkpoint file is removed.
 
 This mode does not compare business keys, validate duplicate keys, require a target unique index, update existing rows, or use merge/UPSERT logic. Configured `business_key_columns` may be omitted; if present, they are ignored by this mode. Validated rows use the existing insert-only path. PostgreSQL target constraints still apply, and the existing `ON CONFLICT DO NOTHING` guard can skip rows that conflict with an actual target unique constraint. Other rejected rows are isolated and written to `migration_error_log`.
 
@@ -309,11 +309,11 @@ Checkpoints store:
 - `status`
 - `business_key_columns`
 
-Duplicate insert-only incremental tables additionally use `last_incremental_seen_count` to resume within a timestamp group. Their authoritative checkpoint is stored in target table `migration_duplicate_checkpoint`; normal keyed tables continue using their business-key checkpoint fields in the configured JSON checkpoint file.
+Duplicate insert-only incremental tables additionally use `last_incremental_seen_count` to resume within a timestamp group. Normal keyed tables continue using their business-key checkpoint fields.
 
 Old checkpoints with a mismatched business-key definition are ignored for that table.
 
-If a run stops unexpectedly, committed batches remain in the target and the next run resumes from the last atomic checkpoint. Target commits use `synchronous_commit=on` for the migration session. For duplicate insert-only incremental tables, the target-side checkpoint is committed in the same transaction as the inserted rows, avoiding replay caused by a JSON checkpoint write lag. Normal keyed loads remain replay-safe through strict business-key validation plus UPSERT/`ON CONFLICT` handling.
+If a run stops unexpectedly, committed batches remain in the target and the next run resumes from the last atomic checkpoint. Target commits use `synchronous_commit=on` for the migration session. A batch committed immediately before its checkpoint update may be replayed; strict unique business-key validation plus UPSERT/`ON CONFLICT` handling makes that replay safe for keyed loads.
 
 When `disable_triggers_globally: true`, the original state of each user trigger is stored in the target schema's `migration_trigger_state` table before triggers are disabled. Normal cleanup restores that state. If the process or server terminates, the next run restores recorded trigger states immediately after acquiring the advisory lock and before migrating tables. `sql/02_disabled_triggers.sql` remains useful as an independent safety check.
 

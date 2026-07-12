@@ -216,6 +216,20 @@ class MigrationSafetyTests(unittest.TestCase):
         )
         self.assertEqual(compatible, (True, True))
 
+    def test_double_precision_to_integer_is_compatible(self):
+        compatible = migration.is_type_compatible(
+            {"data_type": "double precision", "udt_name": "float8"},
+            {"data_type": "integer", "udt_name": "int4"},
+        )
+        self.assertEqual(compatible, (True, True))
+
+    def test_real_to_smallint_is_compatible(self):
+        compatible = migration.is_type_compatible(
+            {"data_type": "real", "udt_name": "float4"},
+            {"data_type": "smallint", "udt_name": "int2"},
+        )
+        self.assertEqual(compatible, (True, True))
+
     def test_numeric_to_integer_is_compatible(self):
         compatible = migration.is_type_compatible(
             {"data_type": "numeric", "udt_name": "numeric"},

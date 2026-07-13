@@ -16,6 +16,13 @@ python migration_incremental_sync.py
 python migration_full_sync.py
 ```
 
+Run post-migration accuracy validation:
+
+```bash
+python migration_accuracy_validate.py --config config_full_load.yaml
+python migration_accuracy_validate.py --config config_incremental_load.yaml
+```
+
 - `migration_incremental_sync.py` defaults to `config_incremental_load.yaml`, writes `migration_incremental_sync.log`, and uses `migration_incremental_load_checkpoint.json`.
 - `migration_full_sync.py` defaults to `config_full_load.yaml`, writes `migration_full_sync.log`, and uses `migration_full_load_checkpoint.json`.
 - Both scripts accept `--config` to override their default YAML file.
@@ -41,6 +48,7 @@ python migration_full_sync.py
 - Creates configured range/list partitions from each fetched batch instead of scanning the full source partition range up front.
 - Records trigger state in `migration_trigger_state` and restores it automatically after an interrupted run.
 - Reports per-table source-window, processed, inserted, updated, rejected, conflict-skipped, and source/target count reconciliation.
+- Provides a separate source/target accuracy validator that stores count, range, key-hash, and row-hash comparison results in the target database.
 - Continues other tables after a table failure when `stop_on_table_error: false`.
 
 ## Configuration Reference
@@ -328,6 +336,56 @@ The reconciliation report uses source and target `COUNT(*)` queries. These provi
 - Review failed/skipped tables, `Unaccounted`, `WindowDifference`, conflict-skipped rows, and `migration_error_log` after every run.
 - Confirm the disabled-trigger check is clean before returning the target to normal operation.
 - Verify sequence state directly with `SELECT last_value, is_called FROM schema.sequence_name`; `pg_sequences.last_value` can be NULL for users without sequence privileges.
+
+## Accuracy Validation
+
+Use `migration_accuracy_validate.py` after a load when source and target are in different RDS databases and cross-database SQL is not available. The script connects to source and target separately, computes local aggregates on each side, compares them in Python, and writes one result row per configured table into the target database.
+
+```bash
+python migration_accuracy_validate.py --config config_full_load.yaml
+python migration_accuracy_validate.py --config config_incremental_load.yaml
+```
+
+Validate only one table:
+
+```bash
+python migration_accuracy_validate.py --config config_incremental_load.yaml --table protrgcustmappkey
+```
+
+By default, results are stored in:
+
+```sql
+public.migration_accuracy_log
+```
+
+Override the target result table:
+
+```bash
+python migration_accuracy_validate.py --config config_full_load.yaml --validation-table migration_full_accuracy_log
+```
+
+Review latest results:
+
+```sql
+SELECT validation_time, source_table, target_table, status,
+       source_total, source_scope_count, target_total, target_difference,
+       source_incremental_null_count
+FROM public.migration_accuracy_log
+ORDER BY validation_time DESC;
+```
+
+Status meanings:
+
+| Status | Meaning |
+| --- | --- |
+| `MATCH` | Scoped source count, key signature, and row signature match target. |
+| `COUNT_MISMATCH` | Target count differs from the source scope count. |
+| `CONTENT_MISMATCH` | Counts match, but key or row hash differs. |
+| `VALIDATION_FAILED` | Validation query failed; see `details`. |
+
+For incremental tables, `source_scope_count` uses `incremental_column IS NOT NULL`, because rows with NULL incremental values are not eligible for incremental migration. `source_total` still records the full source table count so NULL-window gaps are visible.
+
+The hash checks are order-independent aggregate signatures over common source/target columns. They are designed for large-table validation without pulling all data into Python. If hashes differ, use table-specific SQL by business key to inspect sample row differences.
 
 ## Validation SQL
 

@@ -1064,9 +1064,14 @@ def ensure_default_partition(target_conn, cfg, table_cfg, load_type):
         return None
     target_schema = cfg["target"]["schema"]
     target_table = table_cfg["target_table"]
+    cache = cfg["migration"].setdefault("_ensured_default_partitions", set())
+    cache_key = (target_schema, target_table)
+    if cache_key in cache:
+        return None
     existing = get_default_partition(target_conn, target_schema, target_table)
     if existing:
         logging.info(f"[{target_table}] Default partition already exists: {existing}")
+        cache.add(cache_key)
         return existing
     name_format = table_cfg.get(
         "default_partition_name_format",
@@ -1084,6 +1089,7 @@ def ensure_default_partition(target_conn, cfg, table_cfg, load_type):
         cur.execute(query)
     target_conn.commit()
     logging.info(f"[{target_table}] Default partition created: {partition_name}")
+    cache.add(cache_key)
     return partition_name
 
 
@@ -1218,7 +1224,11 @@ def ensure_single_partition_target_for_rows(
     if partition_type == "range":
         granularity = cfg["migration"].get("partition_granularity", "monthly")
         required_starts = sorted({partition_start(value, granularity) for value in values})
+        cache = cfg["migration"].setdefault("_ensured_partitions", set())
         for required_start in required_starts:
+            cache_key = (target_schema, target_table, partition_type, granularity, required_start)
+            if cache_key in cache:
+                continue
             create_range_partitions(
                 target_conn,
                 target_schema,
@@ -1228,13 +1238,24 @@ def ensure_single_partition_target_for_rows(
                 granularity,
                 name_format,
             )
+            cache.add(cache_key)
     elif partition_type == "list":
+        cache = cfg["migration"].setdefault("_ensured_partitions", set())
+        new_values = []
+        for value in dict.fromkeys(values):
+            cache_key = (target_schema, target_table, partition_type, value)
+            if cache_key in cache:
+                continue
+            cache.add(cache_key)
+            new_values.append(value)
+        if not new_values:
+            return
         create_list_partitions(
             target_conn,
             target_schema,
             target_table,
             partition_column,
-            list(dict.fromkeys(values)),
+            new_values,
             name_format,
         )
     else:

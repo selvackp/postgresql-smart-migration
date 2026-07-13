@@ -469,6 +469,54 @@ class MigrationSafetyTests(unittest.TestCase):
         ensure_default.assert_called_once()
         self.assertEqual(ensure_default.call_args.args[2]["target_table"], "protrgcmcust")
 
+    def test_partition_checks_are_cached_per_run(self):
+        cfg = {
+            "target": {"schema": "public"},
+            "migration": {"create_missing_partitions": True},
+        }
+        table_cfg = {
+            "target_table": "procmcust",
+            "partition_column": "chnid",
+            "partition_type": "list",
+            "trigger_partition_targets": [
+                {
+                    "target_table": "protrgcmcust",
+                    "partition_column": "chnid",
+                    "partition_type": "list",
+                }
+            ],
+        }
+        rows = [(101, 31), (102, 32)]
+        with mock.patch.object(migration, "create_list_partitions") as create_partitions, \
+                mock.patch.object(migration, "ensure_default_partition"):
+            migration.ensure_partitions_for_rows(
+                object(), cfg, table_cfg, ["custid", "chnid"], rows
+            )
+            migration.ensure_partitions_for_rows(
+                object(), cfg, table_cfg, ["custid", "chnid"], rows
+            )
+        self.assertEqual(create_partitions.call_count, 2)
+
+    def test_default_partition_check_is_cached_per_run(self):
+        connection = FakeConnection()
+        cfg = {
+            "target": {"schema": "public"},
+            "migration": {"create_default_partition": True},
+        }
+        table_cfg = {"target_table": "orders", "partition_column": "created_at"}
+        with mock.patch.object(
+            migration, "get_default_partition", return_value="orders_default"
+        ) as get_default:
+            first = migration.ensure_default_partition(
+                connection, cfg, table_cfg, load_type="incremental"
+            )
+            second = migration.ensure_default_partition(
+                connection, cfg, table_cfg, load_type="incremental"
+            )
+        self.assertEqual(first, "orders_default")
+        self.assertIsNone(second)
+        get_default.assert_called_once()
+
     def test_first_full_keyset_page_has_no_sentinel_parameters(self):
         connection = FakeConnection(rows=[(1,)])
         result = migration.fetch_full_batch(

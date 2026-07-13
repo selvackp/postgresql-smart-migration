@@ -337,7 +337,7 @@ Example: loading `procmcust` fires a trigger that inserts into list-partitioned 
 
 `source_column` is read from the parent batch rows. `partition_column` is the trigger target's partition key. If both names are the same, keep both for readability. The global or per-target partition name formats still apply, for example `range_partition_name_format: "{table}_p{yyyymmdd}"` and `list_partition_name_format: "{table}_p{value}"`.
 
-For each configured trigger target, the script also ensures a DEFAULT partition when `create_default_partition` is enabled. Existing default partitions are reused, and existing explicit partitions are ignored through PostgreSQL `CREATE TABLE IF NOT EXISTS` plus overlap handling. You can override the default partition name per trigger target:
+For each configured trigger target, the script also ensures a DEFAULT partition when `create_default_partition` is enabled. Existing default partitions are reused, and existing explicit partitions are ignored through PostgreSQL `CREATE TABLE IF NOT EXISTS` plus overlap handling. Partition checks are cached for the current run, so the same table/value child and the same DEFAULT partition are not checked again on every batch. You can override the default partition name per trigger target:
 
 ```yaml
 trigger_partition_targets:

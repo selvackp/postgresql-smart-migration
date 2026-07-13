@@ -1138,15 +1138,80 @@ def ensure_partitions(source_conn, target_conn, cfg, table_cfg):
 def ensure_partitions_for_rows(target_conn, cfg, table_cfg, source_columns, rows):
     if not cfg["migration"].get("create_missing_partitions", True):
         return
-    partition_column = table_cfg.get("partition_column")
-    if not partition_column or not rows:
+    if not rows:
         return
+    partition_column = table_cfg.get("partition_column")
+    if partition_column:
+        ensure_single_partition_target_for_rows(
+            target_conn,
+            cfg,
+            table_cfg,
+            source_columns,
+            rows,
+            target_table=table_cfg["target_table"],
+            partition_column=partition_column,
+            partition_type=table_cfg.get("partition_type"),
+            source_column=partition_column,
+            log_owner=table_cfg["target_table"],
+        )
+    ensure_trigger_partition_targets_for_rows(target_conn, cfg, table_cfg, source_columns, rows)
+
+
+def ensure_trigger_partition_targets_for_rows(target_conn, cfg, table_cfg, source_columns, rows):
+    for trigger_target in table_cfg.get("trigger_partition_targets") or []:
+        target_table = trigger_target.get("target_table")
+        partition_column = trigger_target.get("partition_column")
+        partition_type = trigger_target.get("partition_type")
+        source_column = trigger_target.get("source_column", partition_column)
+        if not target_table or not partition_column or not partition_type:
+            raise Exception(
+                f"[{table_cfg['target_table']}] trigger_partition_targets requires "
+                "target_table, partition_column, and partition_type"
+            )
+        ensure_single_partition_target_for_rows(
+            target_conn,
+            cfg,
+            trigger_target,
+            source_columns,
+            rows,
+            target_table=target_table,
+            partition_column=partition_column,
+            partition_type=partition_type,
+            source_column=source_column,
+            log_owner=table_cfg["target_table"],
+        )
+        ensure_default_partition(
+            target_conn,
+            cfg,
+            {
+                **trigger_target,
+                "target_table": target_table,
+                "partition_column": partition_column,
+            },
+            load_type="incremental",
+        )
+
+
+def ensure_single_partition_target_for_rows(
+    target_conn,
+    cfg,
+    partition_cfg,
+    source_columns,
+    rows,
+    target_table,
+    partition_column,
+    partition_type,
+    source_column,
+    log_owner,
+):
     target_schema = cfg["target"]["schema"]
-    target_table = table_cfg["target_table"]
-    partition_type = table_cfg.get("partition_type")
+    if source_column not in source_columns:
+        raise Exception(
+            f"[{log_owner}] Partition source column {source_column} not found for target {target_table}"
+        )
     name_format_key = f"{partition_type}_partition_name_format"
-    name_format = table_cfg.get(name_format_key, cfg["migration"].get(name_format_key))
-    column_index = source_columns.index(partition_column)
+    name_format = partition_cfg.get(name_format_key, cfg["migration"].get(name_format_key))
+    column_index = source_columns.index(source_column)
     values = [row[column_index] for row in rows if row[column_index] is not None]
     if not values:
         return

@@ -139,6 +139,7 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `list_partition_name_format` | Global setting | Optional per-table override for list partition names. |
 | `create_default_partition` | Global setting | Optional per-table override for automatic DEFAULT partition creation on incremental loads. |
 | `default_partition_name_format` | Global setting | Optional per-table override for the DEFAULT partition name. |
+| `trigger_partition_targets` | Optional | Extra partitioned target tables that must have partitions created from this table's batch before triggers fire. Use this when a parent-table trigger inserts into another partitioned table. |
 | `column_defaults` | `{}` | Values applied when a source value is NULL, and also used for target-only columns that are not present in the source. |
 | `skip_bad_rows` | Global setting | Optional table override for bad-row behavior. |
 | `disable_triggers_during_load` | Global setting | Optional table override for trigger disable/enable behavior. |
@@ -287,6 +288,65 @@ list_partition_name_format: "{table}_p{value}"
 Both format keys can be defined globally under `migration` or overridden inside an individual table entry. Existing partitions are matched by their bounds, so changing the format affects only newly created partitions.
 
 After a configured incremental range/list table finishes loading, the script creates `{table}_default` when no DEFAULT child already exists. Full-load tables never create a DEFAULT partition automatically. This catch-all prevents later incremental inserts from failing when no explicit child covers a value. Before attaching a future range/list partition, move or remove any matching rows from the DEFAULT partition; PostgreSQL will reject an overlapping child while matching rows remain there. Set `create_default_partition: false` globally or per table to disable this behavior.
+
+### Trigger target partitions
+
+When triggers stay enabled during migration, a parent table can insert into another partitioned table. The script normally creates partitions only for the configured target table, so add `trigger_partition_targets` when the trigger target also needs child partitions.
+
+Example: loading `procmcustmappkey` fires a trigger that inserts into range-partitioned `protrgcustmappkey` by `crtdate`:
+
+```yaml
+- source_table: procmcustmappkey
+  target_table: procmcustmappkey
+  load_type: incremental
+  incremental_column: crtdate
+  partition_column: crtdate
+  partition_type: range
+  business_key_columns:
+    - sessionid
+    - crtdate
+  disable_triggers_during_load: false
+  trigger_partition_targets:
+    - target_table: protrgcustmappkey
+      partition_type: range
+      partition_column: crtdate
+      source_column: crtdate
+  enabled: true
+```
+
+Example: loading `procmcust` fires a trigger that inserts into list-partitioned `protrgcmcust` by `chnid`:
+
+```yaml
+- source_table: procmcust
+  target_table: procmcust
+  load_type: incremental
+  incremental_column: custid
+  partition_column: chnid
+  partition_type: list
+  business_key_columns:
+    - custid
+    - chnid
+  disable_triggers_during_load: false
+  trigger_partition_targets:
+    - target_table: protrgcmcust
+      partition_type: list
+      partition_column: chnid
+      source_column: chnid
+  enabled: true
+```
+
+`source_column` is read from the parent batch rows. `partition_column` is the trigger target's partition key. If both names are the same, keep both for readability. The global or per-target partition name formats still apply, for example `range_partition_name_format: "{table}_p{yyyymmdd}"` and `list_partition_name_format: "{table}_p{value}"`.
+
+For each configured trigger target, the script also ensures a DEFAULT partition when `create_default_partition` is enabled. Existing default partitions are reused, and existing explicit partitions are ignored through PostgreSQL `CREATE TABLE IF NOT EXISTS` plus overlap handling. You can override the default partition name per trigger target:
+
+```yaml
+trigger_partition_targets:
+  - target_table: protrgcustmappkey
+    partition_type: range
+    partition_column: crtdate
+    source_column: crtdate
+    default_partition_name_format: "{table}_default"
+```
 
 ### Partition requirements
 

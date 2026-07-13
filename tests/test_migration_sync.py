@@ -396,6 +396,79 @@ class MigrationSafetyTests(unittest.TestCase):
             )
         self.assertEqual(create_partitions.call_count, 2)
 
+    def test_trigger_range_partitions_are_created_from_parent_batch(self):
+        cfg = {
+            "target": {"schema": "public"},
+            "migration": {
+                "create_missing_partitions": True,
+                "partition_granularity": "daily",
+                "range_partition_name_format": "{table}_p{yyyymmdd}",
+            },
+        }
+        table_cfg = {
+            "target_table": "procmcustmappkey",
+            "partition_column": "crtdate",
+            "partition_type": "range",
+            "trigger_partition_targets": [
+                {
+                    "target_table": "protrgcustmappkey",
+                    "partition_column": "crtdate",
+                    "partition_type": "range",
+                    "source_column": "crtdate",
+                }
+            ],
+        }
+        rows = [
+            ("a", date(2026, 3, 23)),
+            ("b", date(2026, 3, 23)),
+            ("c", date(2026, 3, 24)),
+        ]
+        with mock.patch.object(migration, "create_range_partitions") as create_partitions, \
+                mock.patch.object(migration, "ensure_default_partition") as ensure_default:
+            migration.ensure_partitions_for_rows(
+                object(), cfg, table_cfg, ["sessionid", "crtdate"], rows
+            )
+        target_tables = [call.args[2] for call in create_partitions.call_args_list]
+        self.assertEqual(target_tables.count("procmcustmappkey"), 2)
+        self.assertEqual(target_tables.count("protrgcustmappkey"), 2)
+        ensure_default.assert_called_once()
+        self.assertEqual(ensure_default.call_args.args[2]["target_table"], "protrgcustmappkey")
+
+    def test_trigger_list_partitions_are_created_from_parent_batch(self):
+        cfg = {
+            "target": {"schema": "public"},
+            "migration": {
+                "create_missing_partitions": True,
+                "list_partition_name_format": "{table}_p{value}",
+            },
+        }
+        table_cfg = {
+            "target_table": "procmcust",
+            "partition_column": "chnid",
+            "partition_type": "list",
+            "trigger_partition_targets": [
+                {
+                    "target_table": "protrgcmcust",
+                    "partition_column": "chnid",
+                    "partition_type": "list",
+                    "source_column": "chnid",
+                }
+            ],
+        }
+        rows = [(101, 31), (102, 31), (103, 32)]
+        with mock.patch.object(migration, "create_list_partitions") as create_partitions, \
+                mock.patch.object(migration, "ensure_default_partition") as ensure_default:
+            migration.ensure_partitions_for_rows(
+                object(), cfg, table_cfg, ["custid", "chnid"], rows
+            )
+        calls = create_partitions.call_args_list
+        self.assertEqual(calls[0].args[2], "procmcust")
+        self.assertEqual(calls[0].args[4], [31, 32])
+        self.assertEqual(calls[1].args[2], "protrgcmcust")
+        self.assertEqual(calls[1].args[4], [31, 32])
+        ensure_default.assert_called_once()
+        self.assertEqual(ensure_default.call_args.args[2]["target_table"], "protrgcmcust")
+
     def test_first_full_keyset_page_has_no_sentinel_parameters(self):
         connection = FakeConnection(rows=[(1,)])
         result = migration.fetch_full_batch(

@@ -42,10 +42,12 @@ python migration_accuracy_validate.py --config config_incremental_load.yaml
 - Keeps UPSERT behavior using business keys and protects inserts with `ON CONFLICT DO NOTHING`.
 - Auto-detects a primary key or unique key when `business_key_columns` is not configured.
 - Creates missing range/list partitions when configured.
+- Can create partitions for trigger target tables before parent-table triggers fire, using `trigger_partition_targets`.
 - Validates NOT NULL values, string length, JSON/JSONB values, and array literals.
 - Logs bad rows into `migration_error_log`; numeric/decimal values are stored as strings, dates/timestamps as ISO text, UUIDs as strings, and binary values as Base64 text in `row_data` JSON.
 - Isolates PostgreSQL data/integrity errors to individual rows and records conflict-skipped rows instead of losing them silently.
 - Creates configured range/list partitions from each fetched batch instead of scanning the full source partition range up front.
+- Caches partition and DEFAULT partition checks for the current run to avoid repeating the same DDL checks every batch.
 - Records trigger state in `migration_trigger_state` and restores it automatically after an interrupted run.
 - Reports per-table source-window, processed, inserted, updated, rejected, conflict-skipped, and source/target count reconciliation.
 - Provides a separate source/target accuracy validator that stores count, range, key-hash, and row-hash comparison results in the target database.
@@ -145,6 +147,19 @@ Sequence detection uses `pg_get_serial_sequence`, which returns the exact schema
 | `disable_triggers_during_load` | Global setting | Optional table override for trigger disable/enable behavior. |
 
 Business-key values in the source must contain no NULLs or duplicates. Incremental loads require the target key to have a matching non-partial unique index for replay-safe UPSERT behavior. Full loads may proceed without that target index and emit a warning, though merges can be slower. A source unique index is preferred for performance but is not mandatory; without one, pre-migration validation scans current source data. The first keyset page has no artificial lower-bound sentinel, so negative numbers, empty strings, and dates before 1900 are not skipped. For `load_type: full` tables without any key, the script uses insert-only mode with `OFFSET`-based batching; use it only for stable source tables, and preferably start from an empty target to avoid duplicates when no target unique constraint exists.
+
+`trigger_partition_targets` entries support these keys:
+
+| Key | Required/default | Meaning |
+| --- | --- | --- |
+| `target_table` | Required | Partitioned table that the parent-table trigger writes into. |
+| `partition_type` | Required | `range` or `list`, matching the trigger target table. |
+| `partition_column` | Required | Partition key column on the trigger target table. |
+| `source_column` | `partition_column` | Column from the parent source batch whose values should drive trigger-target partition creation. |
+| `range_partition_name_format` | Global setting | Optional name override for this trigger target. |
+| `list_partition_name_format` | Global setting | Optional name override for this trigger target. |
+| `create_default_partition` | Global setting | Optional override for DEFAULT partition creation on this trigger target. |
+| `default_partition_name_format` | Global setting | Optional DEFAULT partition name override for this trigger target. |
 
 For a legacy incremental target that cannot add a unique index, opt in explicitly:
 
@@ -390,12 +405,69 @@ The reconciliation report uses source and target `COUNT(*)` queries. These provi
 - Back up the target and test the complete YAML configuration in staging first.
 - Disable table entries whose source tables do not exist, and verify source/target schema names.
 - Use stable business keys that match the logical row identity; partitioned-table unique keys normally include the partition column.
+- Keep trigger-generated/audit tables out of the table list when they require generated values not present in source. Let the parent table triggers populate them, and configure `trigger_partition_targets` so their partitions exist before triggers fire.
 - Control application writes when `allow_incremental_without_target_unique_index: true` is used.
 - Reconcile source/target values that conflict with alternate target unique constraints; full load does not bypass uniqueness or truncate the target.
 - Remove only the affected table checkpoint before intentionally rerunning a completed full load.
 - Review failed/skipped tables, `Unaccounted`, `WindowDifference`, conflict-skipped rows, and `migration_error_log` after every run.
 - Confirm the disabled-trigger check is clean before returning the target to normal operation.
 - Verify sequence state directly with `SELECT last_value, is_called FROM schema.sequence_name`; `pg_sequences.last_value` can be NULL for users without sequence privileges.
+
+## Large Migration Operations
+
+For very large or trigger-heavy tables, prefer smaller stable batches over one large transaction. Start with:
+
+```yaml
+migration:
+  batch_size: 5000
+  sleep_seconds: 0
+```
+
+If triggers perform extra inserts, lookups, vector-code generation, or partition creation, use:
+
+```yaml
+migration:
+  batch_size: 1000
+  sleep_seconds: 0
+```
+
+If PostgreSQL shows `wait_event_type = Client` and `wait_event = ClientRead`, the database is waiting for the Python client to send the next command or COPY data. That is not a database lock. If the state is `idle in transaction (aborted)`, terminate the backend and rerun from checkpoint:
+
+```sql
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE application_name = 'target_migration_sync'
+  AND state = 'idle in transaction (aborted)';
+```
+
+For trigger-heavy parent tables, either:
+
+- keep triggers enabled and configure `trigger_partition_targets` for every partitioned table the triggers write into, or
+- disable triggers and migrate the trigger target tables directly only when their required columns exist in source or are database-generated on target.
+
+Do not migrate trigger target tables directly when they require target-only NOT NULL IDs that are normally generated by the trigger and the target schema has no default/identity for those IDs.
+
+## Common Messages
+
+`Target NOT NULL columns missing from source and without DB/config default`
+
+The target has a required column not present in the source and PostgreSQL cannot generate it. Add the column to the source/view, add a safe `column_defaults` value for non-key constants, or let a trigger populate the row instead of migrating that trigger table directly.
+
+`no partition of relation "..." found for row`
+
+A trigger or the configured target is inserting into a partitioned table whose child partition does not exist. Add `partition_column`/`partition_type` for the configured table, or add `trigger_partition_targets` when the missing partition belongs to a table written by a trigger.
+
+`Default partition already exists`
+
+This is informational. The script reuses the existing DEFAULT partition. During a single run, the check is cached after the first lookup.
+
+`Range partition overlap. Skipping ...`
+
+Another partition already covers that range. The script logs and continues.
+
+`Row skipped by ON CONFLICT DO NOTHING`
+
+The row hit an existing target unique/primary-key constraint. Review alternate unique constraints, not only the configured business key.
 
 ## Accuracy Validation
 

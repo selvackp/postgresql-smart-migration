@@ -352,6 +352,14 @@ Validate only one table:
 python migration_accuracy_validate.py --config config_incremental_load.yaml --table protrgcustmappkey
 ```
 
+Also write day/month/value level validation results:
+
+```bash
+python migration_accuracy_validate.py --config config_incremental_load.yaml --table protrgcustmappkey --bucket --bucket-column crtdate --bucket-granularity daily
+```
+
+When `--bucket-column` is omitted, the validator uses the table `partition_column`, then `incremental_column`.
+
 By default, results are stored in:
 
 ```sql
@@ -364,6 +372,18 @@ Override the target result table:
 python migration_accuracy_validate.py --config config_full_load.yaml --validation-table migration_full_accuracy_log
 ```
 
+Bucket results are stored in:
+
+```sql
+public.migration_accuracy_bucket_log
+```
+
+Override the bucket result table:
+
+```bash
+python migration_accuracy_validate.py --config config_incremental_load.yaml --bucket --bucket-validation-table migration_incremental_accuracy_bucket_log
+```
+
 Review latest results:
 
 ```sql
@@ -372,6 +392,17 @@ SELECT validation_time, source_table, target_table, status,
        source_incremental_null_count
 FROM public.migration_accuracy_log
 ORDER BY validation_time DESC;
+```
+
+Review bucket mismatches:
+
+```sql
+SELECT validation_time, source_table, target_table, bucket_column,
+       bucket_granularity, bucket_value, status,
+       source_count, target_count, count_difference
+FROM public.migration_accuracy_bucket_log
+WHERE status <> 'MATCH'
+ORDER BY validation_time DESC, target_table, bucket_value;
 ```
 
 Status meanings:
@@ -386,6 +417,8 @@ Status meanings:
 For incremental tables, `source_scope_count` uses `incremental_column IS NOT NULL`, because rows with NULL incremental values are not eligible for incremental migration. `source_total` still records the full source table count so NULL-window gaps are visible.
 
 The hash checks are order-independent aggregate signatures over common source/target columns. They are designed for large-table validation without pulling all data into Python. If hashes differ, use table-specific SQL by business key to inspect sample row differences.
+
+Bucket validation uses the same count/key-hash/row-hash comparison per bucket. Use `--bucket-granularity daily` for date/timestamp columns, `monthly` for monthly reconciliation, and `value` for list-partition keys such as `chnid`.
 
 ## Validation SQL
 

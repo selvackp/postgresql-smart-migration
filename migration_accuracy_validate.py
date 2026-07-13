@@ -164,6 +164,36 @@ def create_validation_table(conn, schema_name, table_name):
     conn.commit()
 
 
+def create_bucket_validation_table(conn, schema_name, table_name):
+    query = sql.SQL("""
+        CREATE TABLE IF NOT EXISTS {schema}.{table} (
+            id bigserial PRIMARY KEY,
+            run_id text NOT NULL,
+            validation_time timestamptz NOT NULL DEFAULT now(),
+            source_table text NOT NULL,
+            target_table text NOT NULL,
+            load_type text,
+            bucket_column text NOT NULL,
+            bucket_granularity text NOT NULL,
+            bucket_value text NOT NULL,
+            status text NOT NULL,
+            source_count bigint,
+            target_count bigint,
+            count_difference bigint,
+            key_columns jsonb,
+            compared_columns jsonb,
+            source_key_hash text,
+            target_key_hash text,
+            source_row_hash text,
+            target_row_hash text,
+            details jsonb
+        )
+    """).format(schema=sql.Identifier(schema_name), table=sql.Identifier(table_name))
+    with conn.cursor() as cur:
+        cur.execute(query)
+    conn.commit()
+
+
 def text_expr(columns):
     parts = [
         sql.SQL("COALESCE({col}::text, chr(30))").format(col=sql.Identifier(column))
@@ -245,6 +275,104 @@ def aggregate_table(
         "key_hash": row[4],
         "row_hash": row[5],
     }
+
+
+def bucket_expr(column_name, granularity):
+    column = sql.Identifier(column_name)
+    if granularity == "daily":
+        return sql.SQL("date_trunc('day', {column})::date::text").format(column=column)
+    if granularity == "monthly":
+        return sql.SQL("date_trunc('month', {column})::date::text").format(column=column)
+    if granularity == "value":
+        return sql.SQL("{column}::text").format(column=column)
+    raise ValueError("bucket granularity must be daily, monthly, or value")
+
+
+def aggregate_table_by_bucket(
+    conn,
+    schema_name,
+    table_name,
+    compared_columns,
+    key_columns,
+    bucket_column,
+    granularity,
+    incremental_column=None,
+    source_incremental_scope=False,
+):
+    where_parts = [sql.SQL("{bucket} IS NOT NULL").format(bucket=sql.Identifier(bucket_column))]
+    if source_incremental_scope and incremental_column:
+        where_parts.append(sql.SQL("{inc} IS NOT NULL").format(inc=sql.Identifier(incremental_column)))
+    where_clause = sql.SQL("WHERE {conditions}").format(
+        conditions=sql.SQL(" AND ").join(where_parts)
+    )
+
+    bucket_sql = bucket_expr(bucket_column, granularity)
+    row_hash = hash_sum_sql(text_expr(compared_columns))
+    key_expr = text_expr(key_columns)
+    key_hash = hash_sum_sql(key_expr) if key_expr is not None else sql.SQL("NULL")
+
+    query = sql.SQL("""
+        SELECT
+            {bucket_expr} AS bucket_value,
+            COUNT(*)::bigint AS row_count,
+            {key_hash} AS key_hash,
+            {row_hash} AS row_hash
+        FROM {schema}.{table}
+        {where_clause}
+        GROUP BY 1
+        ORDER BY 1
+    """).format(
+        bucket_expr=bucket_sql,
+        schema=sql.Identifier(schema_name),
+        table=sql.Identifier(table_name),
+        where_clause=where_clause,
+        key_hash=key_hash,
+        row_hash=row_hash,
+    )
+    with conn.cursor() as cur:
+        cur.execute(query)
+        rows = cur.fetchall()
+    return {
+        row[0]: {
+            "count": row[1],
+            "key_hash": row[2],
+            "row_hash": row[3],
+        }
+        for row in rows
+    }
+
+
+def insert_bucket_validation_results(conn, schema_name, table_name, results):
+    if not results:
+        return
+    query = sql.SQL("""
+        INSERT INTO {schema}.{table} (
+            run_id, source_table, target_table, load_type,
+            bucket_column, bucket_granularity, bucket_value, status,
+            source_count, target_count, count_difference,
+            key_columns, compared_columns,
+            source_key_hash, target_key_hash,
+            source_row_hash, target_row_hash,
+            details
+        )
+        VALUES (
+            %(run_id)s, %(source_table)s, %(target_table)s, %(load_type)s,
+            %(bucket_column)s, %(bucket_granularity)s, %(bucket_value)s, %(status)s,
+            %(source_count)s, %(target_count)s, %(count_difference)s,
+            %(key_columns)s, %(compared_columns)s,
+            %(source_key_hash)s, %(target_key_hash)s,
+            %(source_row_hash)s, %(target_row_hash)s,
+            %(details)s
+        )
+    """).format(schema=sql.Identifier(schema_name), table=sql.Identifier(table_name))
+    with conn.cursor() as cur:
+        for result in results:
+            values = dict(result)
+            values["key_columns"] = Json(result["key_columns"])
+            values["compared_columns"] = Json(result["compared_columns"])
+            values["details"] = Json(result["details"])
+            cur.execute(query, values)
+    conn.commit()
 
 
 def insert_validation_result(conn, schema_name, table_name, result):
@@ -376,11 +504,109 @@ def validate_table(source_conn, target_conn, cfg, table_cfg, run_id):
     }
 
 
+def validate_table_buckets(
+    source_conn,
+    target_conn,
+    cfg,
+    table_cfg,
+    run_id,
+    bucket_column,
+    bucket_granularity,
+):
+    source_schema = cfg["source"]["schema"]
+    target_schema = cfg["target"]["schema"]
+    source_table = table_cfg["source_table"]
+    target_table = table_cfg["target_table"]
+    load_type = table_cfg.get("load_type", cfg["migration"].get("default_load_type", "incremental"))
+    incremental_column = table_cfg.get("incremental_column")
+
+    source_columns = get_table_columns(source_conn, source_schema, source_table)
+    target_columns = get_table_columns(target_conn, target_schema, target_table)
+    common_columns = [column for column in target_columns if column in set(source_columns)]
+    key_columns = detect_key_columns(source_conn, target_conn, cfg, table_cfg)
+    key_columns = [column for column in key_columns if column in common_columns]
+
+    if bucket_column not in common_columns:
+        raise RuntimeError(f"[{target_table}] bucket column not found in both source and target: {bucket_column}")
+    if not common_columns:
+        raise RuntimeError(f"[{target_table}] No common columns found for bucket validation")
+
+    source_buckets = aggregate_table_by_bucket(
+        source_conn,
+        source_schema,
+        source_table,
+        common_columns,
+        key_columns,
+        bucket_column,
+        bucket_granularity,
+        incremental_column,
+        source_incremental_scope=(load_type == "incremental"),
+    )
+    target_buckets = aggregate_table_by_bucket(
+        target_conn,
+        target_schema,
+        target_table,
+        common_columns,
+        key_columns,
+        bucket_column,
+        bucket_granularity,
+        incremental_column,
+        source_incremental_scope=False,
+    )
+
+    results = []
+    for bucket_value in sorted(set(source_buckets) | set(target_buckets)):
+        source_bucket = source_buckets.get(bucket_value, {})
+        target_bucket = target_buckets.get(bucket_value, {})
+        source_count = int(source_bucket.get("count") or 0)
+        target_count = int(target_bucket.get("count") or 0)
+        count_difference = target_count - source_count
+        key_match = not key_columns or source_bucket.get("key_hash") == target_bucket.get("key_hash")
+        row_match = source_bucket.get("row_hash") == target_bucket.get("row_hash")
+
+        if count_difference == 0 and key_match and row_match:
+            status = "MATCH"
+        elif count_difference == 0:
+            status = "CONTENT_MISMATCH"
+        else:
+            status = "COUNT_MISMATCH"
+
+        results.append({
+            "run_id": run_id,
+            "source_table": f"{source_schema}.{source_table}",
+            "target_table": f"{target_schema}.{target_table}",
+            "load_type": load_type,
+            "bucket_column": bucket_column,
+            "bucket_granularity": bucket_granularity,
+            "bucket_value": bucket_value,
+            "status": status,
+            "source_count": source_count,
+            "target_count": target_count,
+            "count_difference": count_difference,
+            "key_columns": key_columns,
+            "compared_columns": common_columns,
+            "source_key_hash": source_bucket.get("key_hash"),
+            "target_key_hash": target_bucket.get("key_hash"),
+            "source_row_hash": source_bucket.get("row_hash"),
+            "target_row_hash": target_bucket.get("row_hash"),
+            "details": {
+                "key_hash_match": key_match,
+                "row_hash_match": row_match,
+                "source_scope_note": "incremental_column IS NOT NULL" if load_type == "incremental" and incremental_column else "all rows",
+            },
+        })
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Validate migrated PostgreSQL data accuracy")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--table", help="Validate only one target table name")
     parser.add_argument("--validation-table", default=None)
+    parser.add_argument("--bucket", action="store_true", help="Also write bucket-level validation results")
+    parser.add_argument("--bucket-column", default=None, help="Column used for bucket validation; defaults to partition_column then incremental_column")
+    parser.add_argument("--bucket-granularity", choices=("daily", "monthly", "value"), default="daily")
+    parser.add_argument("--bucket-validation-table", default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -390,12 +616,19 @@ def main():
         or cfg["migration"].get("accuracy_table")
         or "migration_accuracy_log"
     )
+    bucket_validation_table = (
+        args.bucket_validation_table
+        or cfg["migration"].get("accuracy_bucket_table")
+        or "migration_accuracy_bucket_log"
+    )
     run_id = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
 
     source_conn = get_connection(cfg["source"], "source_migration_accuracy")
     target_conn = get_connection(cfg["target"], "target_migration_accuracy")
     try:
         create_validation_table(target_conn, target_schema, validation_table)
+        if args.bucket:
+            create_bucket_validation_table(target_conn, target_schema, bucket_validation_table)
         for table_cfg in cfg["migration"]["tables"]:
             if not table_cfg.get("enabled", True):
                 continue
@@ -411,6 +644,35 @@ def main():
                     f"SourceScope={result['source_scope_count']} Target={result['target_total']} "
                     f"Diff={result['details']['scoped_difference']}"
                 )
+                if args.bucket:
+                    bucket_column = (
+                        args.bucket_column
+                        or table_cfg.get("partition_column")
+                        or table_cfg.get("incremental_column")
+                    )
+                    if bucket_column:
+                        bucket_results = validate_table_buckets(
+                            source_conn,
+                            target_conn,
+                            cfg,
+                            table_cfg,
+                            run_id,
+                            bucket_column,
+                            args.bucket_granularity,
+                        )
+                        insert_bucket_validation_results(
+                            target_conn,
+                            target_schema,
+                            bucket_validation_table,
+                            bucket_results,
+                        )
+                        mismatch_count = sum(1 for item in bucket_results if item["status"] != "MATCH")
+                        logging.info(
+                            f"[{target_table}] Bucket validation completed: "
+                            f"buckets={len(bucket_results)}, mismatches={mismatch_count}"
+                        )
+                    else:
+                        logging.warning(f"[{target_table}] Bucket validation skipped; no bucket column configured")
             except Exception as e:
                 logging.exception(f"[{target_table}] Accuracy validation failed: {e}")
                 failure = {
